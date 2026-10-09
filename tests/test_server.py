@@ -209,3 +209,25 @@ class TestPdfUpload:
 
         leftovers = sorted(path.name for path in (tmp_path / slug / "assets").iterdir())
         assert leftovers == []
+
+
+class TestUnknownApiPath:
+    """서버가 낡았을 때 나오는 405를 알아볼 수 있는 404로 바꾼다.
+
+    정적 파일은 요청마다 디스크에서 읽히므로, 오래된 프로세스는 새 UI를
+    띄워 주면서 새 라우트는 모른다. 그때 StaticFiles 마운트가 POST를 받아
+    'Method Not Allowed'를 돌려주는데, 이것만 보고 원인을 알 길이 없다.
+    """
+
+    def test_unknown_api_path_is_404_with_a_hint(self, client):
+        response = client.post("/api/problems/어떤문제/없는기능")
+
+        assert response.status_code == 404
+        assert "재시작" in response.json()["detail"]
+
+    def test_real_api_routes_are_not_shadowed(self, client, slug):
+        assert client.get(f"/api/problems/{slug}").status_code == 200
+        assert client.post("/api/settings", json={"model": None}).status_code == 200
+
+    def test_the_page_itself_still_loads(self, client):
+        assert client.get("/").status_code == 200

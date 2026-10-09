@@ -288,6 +288,27 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="아직 내보내지 않았습니다.")
         return FileResponse(path, filename=path.name, media_type="application/zip")
 
+    # 진짜 API 라우트를 모두 등록한 뒤, 정적 마운트보다 먼저 걸어 둔다.
+    # Starlette는 등록 순서대로 매칭하므로 위의 라우트들이 항상 이긴다.
+    @app.api_route(
+        "/api/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"], include_in_schema=False
+    )
+    def unknown_api_path(rest: str) -> JSONResponse:
+        """없는 API 경로를 알아볼 수 있는 404로 돌려준다.
+
+        이것이 없으면 ``/``의 StaticFiles 마운트가 요청을 받아 'Method Not
+        Allowed'를 돌려준다. 정적 파일은 요청마다 디스크에서 읽히므로 낡은
+        서버 프로세스가 **새 화면을 띄워 주면서 새 라우트는 모르는** 상태가
+        되는데, 405만 보고는 그 사실을 알 길이 없다.
+        """
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"알 수 없는 API 경로입니다: /api/{rest} · "
+                "코드를 고친 뒤라면 서버를 재시작하세요."
+            ),
+        )
+
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
     return app
 
