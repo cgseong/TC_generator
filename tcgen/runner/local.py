@@ -41,7 +41,20 @@ except ImportError:  # pragma: no cover - 설치 환경에 따라 달라진다
     psutil = None  # type: ignore[assignment]
 
 _READ_CHUNK = 64 * 1024
-_KEEP_ENV_VARS = ("SYSTEMROOT", "WINDIR", "TEMP", "TMP", "PATH", "LANG", "LC_ALL")
+# SYSTEMDRIVE가 없으면 Windows API가 '%SystemDrive%'라는 이름의 폴더를 실행
+# 디렉터리에 만들어 버린다. COMSPEC·PATHEXT는 앞으로 붙일 컴파일러 어댑터에 필요하다.
+_KEEP_ENV_VARS = (
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+)
 
 
 def python_command(script_path: Path) -> tuple[str, ...]:
