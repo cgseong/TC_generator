@@ -186,3 +186,26 @@ class TestPdfUpload:
         assert payload["figures"][0]["description"] == "좌상단 (1,1)"
         # 그림 전사는 풀이의 전제다. 고치면 기존 확정은 무효가 되어야 한다.
         assert payload["solution_confirmed"] is False
+
+    def test_a_rejected_upload_keeps_the_previous_pdf(self, client, slug, tmp_path):
+        # 거절된 업로드가 멀쩡한 지문을 지우면, 다음 파싱이 통째로 막힌다.
+        self.upload(client, slug, self.PDF)
+        stored = tmp_path / slug / "assets" / "statement.pdf"
+
+        self.upload(client, slug, b"PK\x03\x04 not a pdf")
+
+        assert stored.read_bytes() == self.PDF
+
+    def test_an_oversized_upload_keeps_the_previous_pdf(self, client, slug, tmp_path):
+        self.upload(client, slug, self.PDF)
+        stored = tmp_path / slug / "assets" / "statement.pdf"
+
+        self.upload(client, slug, self.PDF + b"0" * server.MAX_PDF_BYTES)
+
+        assert stored.read_bytes() == self.PDF
+
+    def test_a_rejected_upload_leaves_no_partial_file(self, client, slug, tmp_path):
+        self.upload(client, slug, b"PK\x03\x04 not a pdf")
+
+        leftovers = sorted(path.name for path in (tmp_path / slug / "assets").iterdir())
+        assert leftovers == []

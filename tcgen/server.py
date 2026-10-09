@@ -298,12 +298,14 @@ def create_app() -> FastAPI:
 async def _store_pdf(file: UploadFile, destination: Path) -> None:
     """PDF를 조각으로 읽어 저장한다. 통째로 메모리에 올리지 않는다.
 
-    상한을 넘거나 PDF가 아니면 받은 만큼을 지우고 거절한다. 반쯤 쓰다 만
-    파일이 남으면 다음 파싱이 그것을 지문으로 읽는다.
+    받는 동안에는 임시 파일에만 쓰고, 검사를 모두 통과했을 때만 제자리로
+    옮긴다. 대상 파일을 먼저 열면 거절된 업로드 하나가 이미 올려 둔 멀쩡한
+    지문을 지워 버린다.
     """
+    staging = destination.with_name(destination.name + ".part")
     total = 0
     try:
-        with destination.open("wb") as sink:
+        with staging.open("wb") as sink:
             while chunk := await file.read(_PDF_CHUNK_BYTES):
                 if total == 0 and not chunk.startswith(_PDF_MAGIC):
                     raise HTTPException(status_code=400, detail="PDF 파일이 아닙니다.")
@@ -319,12 +321,11 @@ async def _store_pdf(file: UploadFile, destination: Path) -> None:
                 sink.write(chunk)
         if total == 0:
             raise HTTPException(status_code=400, detail="빈 파일입니다.")
-    except HTTPException:
-        destination.unlink(missing_ok=True)
-        raise
+        staging.replace(destination)
     except OSError as error:
-        destination.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"PDF를 저장하지 못했습니다: {error}") from error
+    finally:
+        staging.unlink(missing_ok=True)
 
 
 def _workspace(slug: str) -> Workspace:
