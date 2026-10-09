@@ -1,0 +1,21 @@
+# 작업 산출물 — 문제별 작업폴더는 버전 관리 대상이 아니다
+workspaces/
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# 에디터
+.vscode/
+.idea/
+
+# 도구 상태 (프로젝트 산출물이 아님)
+.omc/
+
+# 환경변수가 치환되지 않은 채 생성된 Windows 캐시 폴더
+%SystemDrive%/

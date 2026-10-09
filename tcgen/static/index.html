@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'">
+<title>TC_generator</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>TC_generator</h1>
+  <div id="env-badges" class="badges"></div>
+</header>
+
+<div id="isolation-banner" class="banner banner-warn" hidden></div>
+
+<main class="layout">
+  <aside class="sidebar">
+    <section class="panel">
+      <h2>문제</h2>
+      <form id="new-problem-form" class="inline-form">
+        <input id="new-problem-title" type="text" placeholder="새 문제 제목" required>
+        <button type="submit">추가</button>
+      </form>
+      <ul id="problem-list" class="problem-list"></ul>
+    </section>
+  </aside>
+
+  <section class="content">
+    <div id="no-selection" class="empty">왼쪽에서 문제를 고르거나 새로 추가하세요.</div>
+
+    <div id="workbench" hidden>
+      <div class="tabs">
+        <button class="tab active" data-tab="wizard">위저드</button>
+        <button class="tab" data-tab="expert">전문가</button>
+        <button class="tab" data-tab="report">리포트</button>
+        <span class="spacer"></span>
+        <span id="job-status" class="job-status"></span>
+        <button id="cancel-button" class="danger" hidden>중단</button>
+      </div>
+
+      <!-- 위저드 -->
+      <div id="tab-wizard" class="tab-panel">
+        <details class="step" open>
+          <summary><span class="step-no">1</span> 문제 입력</summary>
+          <div class="step-body">
+            <label>지문 전체 붙여넣기
+              <textarea id="raw-text" rows="6" placeholder="문제 지문을 통째로 붙여넣으면 항목별로 나눠 채웁니다."></textarea>
+            </label>
+            <button id="parse-button">지문 파싱</button>
+            <p class="hint">파싱 결과는 아래 폼에서 반드시 확인·수정하세요.</p>
+
+            <div class="grid">
+              <label>제목<input id="f-title" type="text"></label>
+              <label>시간 제한(ms)<input id="f-time" type="number" min="100"></label>
+              <label>메모리 제한(MB)<input id="f-memory" type="number" min="16"></label>
+            </div>
+            <label>문제 설명<textarea id="f-statement" rows="4"></textarea></label>
+            <div class="grid">
+              <label>입력 설명<textarea id="f-input-spec" rows="3"></textarea></label>
+              <label>출력 설명<textarea id="f-output-spec" rows="3"></textarea></label>
+            </div>
+            <div class="grid">
+              <label>제약 조건<textarea id="f-constraints" rows="3"></textarea></label>
+              <label>힌트<textarea id="f-hints" rows="3"></textarea></label>
+            </div>
+
+            <h3>예제</h3>
+            <div id="examples"></div>
+            <button id="add-example" class="secondary">예제 추가</button>
+
+            <h3>생성 규모</h3>
+            <div class="grid">
+              <label>케이스 수<input id="f-case-count" type="number" min="1"></label>
+              <label>최대 입력 크기(바이트)<input id="f-max-bytes" type="number" min="1024"></label>
+              <label>스트레스 대조 횟수<input id="f-stress" type="number" min="1"></label>
+            </div>
+            <button id="save-button">문제 저장</button>
+          </div>
+        </details>
+
+        <details class="step">
+          <summary><span class="step-no">2</span> 지문 해석 확인 <span id="badge-interpret" class="badge"></span></summary>
+          <div class="step-body">
+            <p class="hint">브루트포스와 정답 코드가 같은 오해를 공유하는 것을 막는 단계입니다.</p>
+            <button id="interpret-button">해석 요약 받기</button>
+            <div id="interpretation" class="readout"></div>
+            <button id="confirm-interpret-button" class="primary">해석을 확인했습니다</button>
+          </div>
+        </details>
+
+        <details class="step">
+          <summary><span class="step-no">3</span> 정답 코드 확정 <span id="badge-solution" class="badge"></span></summary>
+          <div class="step-body">
+            <p class="hint">브루트포스 대조를 통과해야 확정됩니다. 확정 전에는 내보내기가 차단됩니다.</p>
+            <label>직접 작성한 정답 코드(선택)
+              <textarea id="author-source" rows="6" placeholder="비워 두면 LLM이 생성합니다."></textarea>
+            </label>
+            <button id="solution-button" class="primary">정답 코드 확보 및 대조</button>
+            <div id="solution-result" class="readout"></div>
+          </div>
+        </details>
+
+        <details class="step">
+          <summary><span class="step-no">4</span> 테스트케이스 생성 <span id="badge-cases" class="badge"></span></summary>
+          <div class="step-body">
+            <button id="cases-button" class="primary">케이스 생성</button>
+            <div id="cases-table" class="readout"></div>
+            <pre id="case-preview" class="preview" hidden></pre>
+          </div>
+        </details>
+
+        <details class="step">
+          <summary><span class="step-no">5</span> 강도 검증 <span id="badge-strength" class="badge"></span></summary>
+          <div class="step-body">
+            <p class="hint">오답·느린 풀이·메모리 과다 풀이를 만들어 테스트가 이들을 잡는지 확인합니다.</p>
+            <button id="strength-button" class="primary">강도 검증</button>
+            <div id="strength-result" class="readout"></div>
+          </div>
+        </details>
+
+        <details class="step">
+          <summary><span class="step-no">6</span> 내보내기 <span id="badge-export" class="badge"></span></summary>
+          <div class="step-body">
+            <p class="hint">zip 루트에 <code>N.in</code>/<code>N.out</code>과 확장자 없는 <code>info</code>를 넣고, 만든 zip을 다시 읽어 검증합니다.</p>
+            <button id="export-button" class="primary">zip 내보내기</button>
+            <a id="download-link" class="button-link" hidden>zip 내려받기</a>
+            <div id="export-result" class="readout"></div>
+          </div>
+        </details>
+      </div>
+
+      <!-- 전문가 -->
+      <div id="tab-expert" class="tab-panel" hidden>
+        <section class="panel">
+          <h3>전자동 실행</h3>
+          <p class="hint">해석 확인을 건너뛰고 끝까지 진행합니다. 리포트에는 '미확인'으로 남습니다.</p>
+          <button id="run-all-button" class="primary">전체 실행</button>
+        </section>
+        <section class="panel">
+          <h3>설정</h3>
+          <label>모델(비우면 CLI 기본값)
+            <input id="model-input" type="text" placeholder="예: sonnet">
+          </label>
+          <button id="save-settings">저장</button>
+        </section>
+        <section class="panel">
+          <h3>작업 폴더</h3>
+          <pre id="workspace-path" class="preview"></pre>
+        </section>
+      </div>
+
+      <!-- 리포트 -->
+      <div id="tab-report" class="tab-panel" hidden>
+        <button id="refresh-report" class="secondary">새로고침</button>
+        <pre id="report-text" class="preview"></pre>
+      </div>
+    </div>
+  </section>
+
+  <aside class="log-panel">
+    <div class="log-header">
+      <h2>실행 로그</h2>
+      <button id="clear-log" class="secondary">지우기</button>
+    </div>
+    <ul id="log" class="log"></ul>
+  </aside>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
