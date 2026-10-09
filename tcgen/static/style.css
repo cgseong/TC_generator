@@ -208,6 +208,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .empty { color: var(--muted); padding: 40px 0; text-align: center; }
 
 .example-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: end; margin-bottom: 8px; }
+.figure-row { display: grid; grid-template-columns: 160px 240px 1fr; gap: 8px; align-items: start; margin-bottom: 10px; }
 
 .log-panel { position: sticky; top: 12px; max-height: calc(100vh - 110px); display: flex; flex-direction: column; }
 .log-header { display: flex; justify-content: space-between; align-items: center; }

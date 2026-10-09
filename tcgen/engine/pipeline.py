@@ -36,7 +36,7 @@ from tcgen.engine.solution import (
 )
 from tcgen.jobs import Cancelled
 from tcgen.llm import ClaudeCLI, LLMError
-from tcgen.models import Example, Limits, Problem
+from tcgen.models import Example, Figure, Limits, Problem
 from tcgen.runner.base import Runner
 from tcgen.runner.env import EnvironmentReport, probe_environment
 from tcgen.runner.local import LocalRunner
@@ -146,6 +146,62 @@ class Pipeline:
         """지문 전문을 구조화 항목으로 채운다 (PRD F1-2)."""
         self.bus.emit(STAGE_PARSE, "지문을 구조화하는 중입니다.")
         payload = self.cli.ask_json(prompts.parse_statement(raw_text), tag="parse")
+        updated = self._apply_parsed(payload)
+        self.bus.emit(
+            STAGE_PARSE,
+            f"지문 구조화 완료 (예제 {len(updated.examples)}개). 내용을 확인해 주세요.",
+            LEVEL_SUCCESS,
+        )
+        return self._save(updated)
+
+    def parse_pdf(self) -> Problem:
+        """PDF 지문을 읽어 구조화 항목과 그림 전사를 채운다 (PRD F1-7).
+
+        그림이 들어간 문제의 유일한 입력 경로다. 텍스트 붙여넣기와 달리 CLI가
+        파일을 직접 읽으므로, 그림이 담은 정보가 사라지지 않는다.
+        """
+        pdf_path = self.workspace.source_pdf_path
+        if not pdf_path.is_file():
+            raise PipelineError(f"PDF 지문이 없습니다: {pdf_path}")
+
+        self.bus.emit(STAGE_PARSE, "PDF 지문을 읽는 중입니다. 그림까지 확인합니다.")
+        payload = self.cli.ask_json_about_files(
+            prompts.parse_pdf(pdf_path), [pdf_path], tag="parse-pdf"
+        )
+        figures = tuple(
+            Figure.from_dict(item)
+            for item in payload.get("figures", []) or []
+            if isinstance(item, dict)
+        )
+        updated = self._apply_parsed(payload, figures=figures, source_pdf=pdf_path.name)
+
+        self.bus.emit(
+            STAGE_PARSE,
+            f"PDF 구조화 완료 (예제 {len(updated.examples)}개, 그림 {len(figures)}개). "
+            "내용을 확인해 주세요.",
+            LEVEL_SUCCESS,
+        )
+        unresolved = updated.unresolved_figures
+        if unresolved:
+            # 전사가 비면 그 그림의 정보는 아무도 모른다. 조용히 넘기면
+            # 정답 코드와 브루트포스가 같은 오해를 공유한다.
+            refs = ", ".join(figure.ref for figure in unresolved)
+            self.bus.emit(
+                STAGE_PARSE,
+                f"풀이에 필요한 그림의 전사가 비어 있습니다({refs}). 직접 채워 주세요.",
+                LEVEL_WARN,
+                figures=[figure.to_dict() for figure in unresolved],
+            )
+        return self._save(updated)
+
+    def _apply_parsed(
+        self,
+        payload: dict[str, Any],
+        *,
+        figures: tuple[Figure, ...] | None = None,
+        source_pdf: str | None = None,
+    ) -> Problem:
+        """파싱 결과를 현재 문제에 얹는다. 텍스트·PDF 두 경로가 함께 쓴다."""
         current = self.problem
         limits = Limits(
             time_ms=_as_int(payload.get("time_ms"), current.limits.time_ms),
@@ -158,7 +214,7 @@ class Pipeline:
             for item in payload.get("examples", []) or []
             if isinstance(item, dict)
         )
-        updated = current.with_changes(
+        return current.with_changes(
             title=str(payload.get("title") or current.title),
             statement=str(payload.get("statement") or current.statement),
             input_spec=str(payload.get("input_spec") or current.input_spec),
@@ -166,17 +222,13 @@ class Pipeline:
             constraints=str(payload.get("constraints") or current.constraints),
             hints=str(payload.get("hints") or current.hints),
             examples=examples or current.examples,
+            figures=current.figures if figures is None else figures,
+            source_pdf=current.source_pdf if source_pdf is None else source_pdf,
             limits=limits,
             # 지문이 바뀌면 이전 문제로 받은 확정은 더 이상 유효하지 않다.
             solution_confirmed=False,
             interpretation_confirmed=False,
         )
-        self.bus.emit(
-            STAGE_PARSE,
-            f"지문 구조화 완료 (예제 {len(updated.examples)}개). 내용을 확인해 주세요.",
-            LEVEL_SUCCESS,
-        )
-        return self._save(updated)
 
     def interpret(self) -> dict[str, Any]:
         """해석 요약과 모호한 지점을 뽑는다 (PRD F1-4)."""

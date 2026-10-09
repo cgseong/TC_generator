@@ -10,6 +10,10 @@
 
 프롬프트는 argv가 아니라 stdin으로 넘긴다. Windows 명령줄 길이 제한(약 32K)에
 지문이 걸리는 것을 피하기 위함이다.
+
+**예외는 PDF 지문 하나뿐이다.** 그림은 텍스트로 옮겨 붙일 수 없으므로
+:meth:`ClaudeCLI.ask_json_about_files`는 지정한 폴더에 한해 ``Read``를 연다.
+받는 것은 여전히 JSON 텍스트뿐이고, 쓰기·실행·네트워크 도구는 그대로 막힌다.
 """
 
 from __future__ import annotations
@@ -28,6 +32,8 @@ from typing import Any, Callable, Mapping, Sequence
 from tcgen.config import LLM_MAX_RETRIES, LLM_TIMEOUT_S
 
 logger = logging.getLogger(__name__)
+
+READ_TOOL = "Read"
 
 DISALLOWED_TOOLS = (
     "Edit",
@@ -56,6 +62,25 @@ _LOG_STDERR_LIMIT = 4_000
 def redact(text: str) -> str:
     """로그에 남기기 전에 토큰 형태를 가린다."""
     return _SECRET_PATTERN.sub("[REDACTED]", text or "")
+
+
+def resolve_readable_dirs(paths: Sequence[Path]) -> tuple[Path, ...]:
+    """읽기를 열어 줄 폴더 목록을 만든다.
+
+    파일이 실제로 있는지 먼저 확인한다. 없는 경로로 CLI를 띄우면 모델이 파일을
+    못 찾은 채 지문을 지어내고, 그 결과가 조용히 문제로 저장된다.
+    """
+    if not paths:
+        raise LLMError("읽을 파일이 지정되지 않았습니다.")
+    directories: list[Path] = []
+    for path in paths:
+        resolved = Path(path).resolve()
+        if not resolved.is_file():
+            raise LLMError(f"파일을 찾을 수 없습니다: {resolved}")
+        parent = resolved.parent
+        if parent not in directories:
+            directories.append(parent)
+    return tuple(directories)
 
 
 class LLMError(Exception):
@@ -100,9 +125,15 @@ class ClaudeCLI:
     max_retries: int = LLM_MAX_RETRIES
     runner: CommandRunner = field(default=_run_subprocess, repr=False)
 
-    def ask(self, prompt: str, *, tag: str = "ask") -> LLMResponse:
-        """프롬프트를 보내고 응답 텍스트를 받는다."""
-        argv = self._build_argv()
+    def ask(
+        self, prompt: str, *, tag: str = "ask", readable_dirs: Sequence[Path] = ()
+    ) -> LLMResponse:
+        """프롬프트를 보내고 응답 텍스트를 받는다.
+
+        ``readable_dirs``가 주어지면 그 폴더에 한해 ``Read``만 열어 준다.
+        PDF 지문처럼 파일을 직접 보여줘야 하는 호출에만 쓴다.
+        """
+        argv = self._build_argv(readable_dirs=readable_dirs)
         started = time.perf_counter()
         try:
             completed = self.runner(argv, prompt, self.timeout_s)
@@ -120,16 +151,38 @@ class ClaudeCLI:
         """코드 블록 하나를 받아낸다. 실패하면 재시도한다."""
         return self._ask_with_retry(prompt, tag=tag, extract=extract_code_block)
 
-    def ask_json(self, prompt: str, *, tag: str = "json") -> dict[str, Any]:
+    def ask_json(
+        self, prompt: str, *, tag: str = "json", readable_dirs: Sequence[Path] = ()
+    ) -> dict[str, Any]:
         """JSON 객체 하나를 받아낸다. 실패하면 재시도한다."""
-        return self._ask_with_retry(prompt, tag=tag, extract=extract_json)
+        return self._ask_with_retry(
+            prompt, tag=tag, extract=extract_json, readable_dirs=readable_dirs
+        )
+
+    def ask_json_about_files(
+        self, prompt: str, paths: Sequence[Path], *, tag: str = "file"
+    ) -> dict[str, Any]:
+        """지정한 파일만 읽게 하고 JSON 하나를 받아낸다.
+
+        PDF 지문처럼 텍스트로 옮길 수 없는 자료를 다루는 유일한 통로다.
+        파일이 있는 폴더만 ``--add-dir``로 열고 ``Read``만 허용한다. 쓰기·실행·
+        네트워크 도구는 다른 호출과 똑같이 막힌 채로 둔다.
+        """
+        return self.ask_json(prompt, tag=tag, readable_dirs=resolve_readable_dirs(paths))
 
     def _ask_with_retry(
-        self, prompt: str, *, tag: str, extract: Callable[[str], Any]
+        self,
+        prompt: str,
+        *,
+        tag: str,
+        extract: Callable[[str], Any],
+        readable_dirs: Sequence[Path] = (),
     ) -> Any:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
-            response = self.ask(prompt, tag=f"{tag}-{attempt + 1}")
+            response = self.ask(
+                prompt, tag=f"{tag}-{attempt + 1}", readable_dirs=readable_dirs
+            )
             try:
                 return extract(response.text)
             except LLMError as error:
@@ -138,13 +191,20 @@ class ClaudeCLI:
                 prompt = f"{prompt}\n\n[재시도] 직전 응답을 해석할 수 없었습니다: {error}"
         raise LLMError(f"{self.max_retries + 1}회 시도했지만 해석에 실패했습니다: {last_error}")
 
-    def _build_argv(self) -> tuple[str, ...]:
+    def _build_argv(self, *, readable_dirs: Sequence[Path] = ()) -> tuple[str, ...]:
         resolved = shutil.which(self.executable)
         if resolved is None:
             raise LLMError(
                 f"'{self.executable}' 실행 파일을 찾을 수 없습니다. "
                 "Claude Code CLI를 설치하고 PATH에 등록하세요."
             )
+        # --disallowed-tools가 --allowed-tools를 이긴다. Read를 열려면 거부
+        # 목록에서 빼야 한다. 나머지 도구는 어느 경우에도 그대로 막힌다.
+        disallowed = (
+            tuple(tool for tool in DISALLOWED_TOOLS if tool != READ_TOOL)
+            if readable_dirs
+            else DISALLOWED_TOOLS
+        )
         argv = [
             resolved,
             "-p",
@@ -154,10 +214,14 @@ class ClaudeCLI:
             "--strict-mcp-config",
             "--no-session-persistence",
             "--disallowed-tools",
-            " ".join(DISALLOWED_TOOLS),
+            " ".join(disallowed),
         ]
         if self.model:
             argv.extend(["--model", self.model])
+        if readable_dirs:
+            # --add-dir은 가변 인자라 뒤따르는 값을 모두 삼킨다. 맨 끝에 둔다.
+            argv.extend(["--allowed-tools", READ_TOOL, "--add-dir"])
+            argv.extend(str(directory) for directory in readable_dirs)
         return tuple(argv)
 
     def _write_log(

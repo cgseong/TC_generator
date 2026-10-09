@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -25,7 +25,7 @@ from tcgen.config import MAX_STRESS_ROUNDS
 from tcgen.engine.pipeline import Pipeline, PipelineError
 from tcgen.jobs import JobConflict, SessionRegistry, WorkspaceSession
 from tcgen.llm import ClaudeCLI, LLMError
-from tcgen.models import CasePlan, Example, Limits, Problem
+from tcgen.models import CasePlan, Example, Figure, Limits, Problem
 from tcgen.runner.env import probe_environment
 from tcgen.workspace import (
     WorkspaceError,
@@ -46,6 +46,12 @@ _registry = SessionRegistry()
 _ALLOWED_HOSTNAMES: set[str] = {"127.0.0.1", "localhost", "::1"}
 _SSE_POLL_SECONDS = 1.0
 _MAX_RAW_TEXT = 500_000
+
+#: PDF 지문 업로드 상한. 지문 몇 쪽이면 충분하고, 그 이상은 CLI가 읽지 못한다.
+MAX_PDF_BYTES = 20 * 1024 * 1024
+#: PDF 파일의 머리 네 바이트. 확장자나 Content-Type은 클라이언트가 말하는 대로다.
+_PDF_MAGIC = b"%PDF"
+_PDF_CHUNK_BYTES = 1024 * 1024
 
 
 def allow_hostname(hostname: str) -> None:
@@ -105,6 +111,7 @@ class ProblemUpdate(BaseModel):
     constraints: str | None = Field(default=None, max_length=50_000)
     hints: str | None = Field(default=None, max_length=50_000)
     examples: list[dict[str, str]] | None = Field(default=None, max_length=50)
+    figures: list[dict[str, Any]] | None = Field(default=None, max_length=30)
     time_ms: int | None = Field(default=None, ge=1, le=60_000)
     memory_mb: int | None = Field(default=None, ge=1, le=4096)
     case_count: int | None = Field(default=None, ge=1, le=500)
@@ -179,6 +186,29 @@ def create_app() -> FastAPI:
     @app.post("/api/problems/{slug}/parse")
     def post_parse(slug: str, request: ParseRequest) -> dict[str, str]:
         return _launch(slug, "parse", lambda pipeline: pipeline.parse_statement(request.raw_text))
+
+    @app.post("/api/problems/{slug}/source-pdf")
+    async def post_source_pdf(slug: str, file: UploadFile) -> dict[str, Any]:
+        """그림이 든 지문을 PDF로 올린다 (PRD F1-7).
+
+        업로드된 파일 이름은 쓰지 않는다. 작업공간 안의 고정된 이름으로만
+        저장해야 경로 조작과 예측 불가능한 ``--add-dir`` 범위를 둘 다 막는다.
+        """
+        workspace = _workspace(slug)
+        workspace.assets_dir.mkdir(parents=True, exist_ok=True)
+        await _store_pdf(file, workspace.source_pdf_path)
+        problem = workspace.load_problem().with_changes(
+            source_pdf=workspace.source_pdf_path.name
+        )
+        workspace.save_problem(problem)
+        return {"source_pdf": problem.source_pdf, "bytes": workspace.source_pdf_path.stat().st_size}
+
+    @app.post("/api/problems/{slug}/parse-pdf")
+    def post_parse_pdf(slug: str) -> dict[str, str]:
+        workspace = _workspace(slug)
+        if not workspace.source_pdf_path.is_file():
+            raise HTTPException(status_code=409, detail="PDF 지문을 먼저 올려 주세요.")
+        return _launch(slug, "parse-pdf", lambda pipeline: pipeline.parse_pdf())
 
     @app.post("/api/problems/{slug}/interpret")
     def post_interpret(slug: str) -> dict[str, str]:
@@ -263,6 +293,38 @@ def create_app() -> FastAPI:
 
 
 # ----------------------------------------------------------------- 내부 도구
+
+
+async def _store_pdf(file: UploadFile, destination: Path) -> None:
+    """PDF를 조각으로 읽어 저장한다. 통째로 메모리에 올리지 않는다.
+
+    상한을 넘거나 PDF가 아니면 받은 만큼을 지우고 거절한다. 반쯤 쓰다 만
+    파일이 남으면 다음 파싱이 그것을 지문으로 읽는다.
+    """
+    total = 0
+    try:
+        with destination.open("wb") as sink:
+            while chunk := await file.read(_PDF_CHUNK_BYTES):
+                if total == 0 and not chunk.startswith(_PDF_MAGIC):
+                    raise HTTPException(status_code=400, detail="PDF 파일이 아닙니다.")
+                total += len(chunk)
+                if total > MAX_PDF_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"PDF가 너무 큽니다. "
+                            f"{MAX_PDF_BYTES // (1024 * 1024)}MB 이하로 올려 주세요."
+                        ),
+                    )
+                sink.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="빈 파일입니다.")
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+    except OSError as error:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"PDF를 저장하지 못했습니다: {error}") from error
 
 
 def _workspace(slug: str) -> Workspace:
@@ -356,6 +418,8 @@ def _summary(workspace: Workspace) -> dict[str, Any]:
 #: 이 필드들이 바뀌면 기존 정답 확정은 다른 문제에 대한 것이 된다.
 _SOLUTION_CRITICAL_FIELDS = (
     "statement",
+    # 그림 전사는 풀이의 전제다. 바뀌면 기존 확정은 다른 해석에 대한 것이 된다.
+    "figures",
     "input_spec",
     "output_spec",
     "constraints",
@@ -385,13 +449,22 @@ def _apply_update(problem: Problem, request: ProblemUpdate) -> Problem:
         if "examples" in data
         else problem.examples
     )
+    figures = (
+        tuple(Figure.from_dict(item) for item in data["figures"])
+        if "figures" in data
+        else problem.figures
+    )
     text_fields = {
         key: data[key]
         for key in ("title", "statement", "input_spec", "output_spec", "constraints", "hints")
         if key in data
     }
     updated = problem.with_changes(
-        limits=limits, case_plan=case_plan, examples=examples, **text_fields
+        limits=limits,
+        case_plan=case_plan,
+        examples=examples,
+        figures=figures,
+        **text_fields,
     )
     if _solution_inputs_changed(problem, updated, data):
         # 문제가 바뀌었는데 확정 표시가 남아 있으면, A로 확정한 코드로 B의
@@ -409,6 +482,7 @@ def _solution_inputs_changed(before: Problem, after: Problem, data: dict[str, An
         or before.output_spec != after.output_spec
         or before.constraints != after.constraints
         or before.examples != after.examples
+        or before.figures != after.figures
         or before.limits != after.limits
     )
 

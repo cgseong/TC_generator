@@ -21,8 +21,10 @@ CASES_INDEX_FILE = "index.json"
 SOLUTION_FILE = "sol.py"
 BRUTE_FILE = "brute.py"
 VALIDATOR_FILE = "validator.py"
+SOURCE_PDF_FILE = "statement.pdf"
 
 SUBDIRECTORIES: tuple[str, ...] = (
+    "assets",
     "solutions",
     "gens",
     "cases",
@@ -88,6 +90,20 @@ class Workspace:
     @property
     def slug(self) -> str:
         return self.root.name
+
+    @property
+    def assets_dir(self) -> Path:
+        """사용자가 올린 원본 자료(PDF 지문 등)를 두는 곳."""
+        return self.root / "assets"
+
+    @property
+    def source_pdf_path(self) -> Path:
+        """PDF 지문의 저장 위치.
+
+        이름을 고정한다. 업로드된 파일명을 경로로 쓰면 경로 조작의 여지가
+        생기고, CLI에 열어 주는 폴더가 예측 불가능해진다.
+        """
+        return self.assets_dir / SOURCE_PDF_FILE
 
     @property
     def solutions_dir(self) -> Path:

@@ -128,6 +128,10 @@ function renderProblem() {
   $("workspace-path").textContent = `workspaces/${problem.slug}/`;
 
   renderExamples(problem.examples || []);
+  renderFigures(problem.figures || []);
+  $("pdf-status").textContent = problem.source_pdf
+    ? `올린 PDF: ${problem.source_pdf}`
+    : "올린 PDF가 없습니다.";
   setBadge("badge-interpret", problem.interpretation_confirmed ? "확인 완료" : "미확인",
     problem.interpretation_confirmed ? "done" : "");
   setBadge("badge-solution", problem.solution_confirmed ? "확정" : "미확정",
@@ -160,6 +164,60 @@ function exampleRow(example, index) {
   remove.onclick = () => row.remove();
   row.appendChild(remove);
   return row;
+}
+
+const FIGURE_ROLES = [
+  ["spec", "spec · 입력 형식·좌표계 정의"],
+  ["rule", "rule · 규칙 자체를 정의"],
+  ["example_visual", "example_visual · 예제 시각화"],
+  ["decorative", "decorative · 단순 삽화"],
+];
+const CRITICAL_ROLES = ["spec", "rule"];
+
+function renderFigures(figures) {
+  const container = $("figures");
+  container.innerHTML = "";
+  if (!figures.length) {
+    container.textContent = "지문에서 인식된 그림이 없습니다.";
+    setBadge("badge-figures", "없음", "");
+    return;
+  }
+  figures.forEach((figure, index) => container.appendChild(figureRow(figure, index)));
+
+  const unresolved = figures.filter(
+    (figure) => CRITICAL_ROLES.includes(figure.role) && !(figure.description || "").trim()
+  );
+  setBadge(
+    "badge-figures",
+    unresolved.length ? `전사 필요 ${unresolved.length}건` : `${figures.length}건`,
+    unresolved.length ? "blocked" : "done"
+  );
+}
+
+function figureRow(figure, index) {
+  const row = document.createElement("div");
+  row.className = "figure-row";
+  const options = FIGURE_ROLES.map(
+    ([value, label]) =>
+      `<option value="${value}"${figure.role === value ? " selected" : ""}>${label}</option>`
+  ).join("");
+  row.innerHTML =
+    `<label>참조<input type="text" data-role="ref" ` +
+    `value="${escapeHtml(figure.ref || `[그림${index + 1}]`)}"></label>` +
+    `<label>역할<select data-role="role">${options}</select></label>` +
+    `<label>전사<textarea rows="4" data-role="description">` +
+    `${escapeHtml(figure.description || "")}</textarea></label>`;
+  return row;
+}
+
+function collectFigures() {
+  return Array.from($("figures").querySelectorAll(".figure-row"))
+    .map((row) => ({
+      ref: row.querySelector('[data-role="ref"]').value,
+      role: row.querySelector('[data-role="role"]').value,
+      description: row.querySelector('[data-role="description"]').value,
+    }))
+    .filter((figure) => figure.ref.trim() !== "");
 }
 
 function collectExamples() {
@@ -281,6 +339,7 @@ async function saveProblem() {
       constraints: $("f-constraints").value,
       hints: $("f-hints").value,
       examples: collectExamples(),
+      figures: collectFigures(),
       time_ms: Number($("f-time").value),
       memory_mb: Number($("f-memory").value),
       case_count: Number($("f-case-count").value),
@@ -315,6 +374,23 @@ function bind() {
     if (!rawText) throw new Error("붙여넣은 지문이 없습니다.");
     await post("/parse", { raw_text: rawText });
   });
+
+  $("pdf-upload-button").onclick = guard(async () => {
+    const chosen = $("pdf-file").files[0];
+    if (!chosen) throw new Error("올릴 PDF를 선택하세요.");
+    const form = new FormData();
+    form.append("file", chosen);
+    // Content-Type은 브라우저가 boundary와 함께 채우게 둔다.
+    const result = await api(`/api/problems/${encodeURIComponent(state.slug)}/source-pdf`, {
+      method: "POST",
+      headers: {},
+      body: form,
+    });
+    logLocal(`PDF를 올렸습니다 (${result.bytes.toLocaleString()}B).`, "success");
+    await refresh();
+  });
+
+  $("pdf-parse-button").onclick = guard(() => post("/parse-pdf"));
 
   $("interpret-button").onclick = guard(() => post("/interpret"));
   $("confirm-interpret-button").onclick = guard(async () => {

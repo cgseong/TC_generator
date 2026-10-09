@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
+from tcgen.llm import LLMError
 from tcgen.models import CasePlan, Example, Limits, Problem
 from tcgen.workspace import slugify
 
@@ -235,6 +237,13 @@ class FakeCLI:
     def ask_json(self, prompt: str, *, tag: str = "json") -> dict:
         value = self._take(tag)
         return json.loads(value) if isinstance(value, str) else value
+
+    def ask_json_about_files(self, prompt: str, paths, *, tag: str = "file") -> dict:
+        # 진짜 CLI와 같은 지점에서 걸리도록, 파일이 없으면 여기서도 멈춘다.
+        for path in paths:
+            if not Path(path).is_file():
+                raise LLMError(f"파일을 찾을 수 없습니다: {path}")
+        return self.ask_json(prompt, tag=tag)
 
     def _take(self, tag: str) -> Any:
         self.calls.append(tag)

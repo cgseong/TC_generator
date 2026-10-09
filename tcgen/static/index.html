@@ -52,6 +52,18 @@
             <button id="parse-button">지문 파싱</button>
             <p class="hint">파싱 결과는 아래 폼에서 반드시 확인·수정하세요.</p>
 
+            <h3>그림이 있는 지문 (PDF)</h3>
+            <p class="hint">
+              그림은 붙여넣기로 옮겨지지 않습니다. 그림이 입력 형식·좌표계·규칙을
+              정의한다면 지문을 PDF로 올려 주세요. PDF를 직접 읽어 그림까지 글로 옮깁니다.
+            </p>
+            <div class="inline-form">
+              <input id="pdf-file" type="file" accept="application/pdf,.pdf">
+              <button id="pdf-upload-button" class="secondary">PDF 올리기</button>
+              <button id="pdf-parse-button">PDF 파싱</button>
+            </div>
+            <div id="pdf-status" class="readout"></div>
+
             <div class="grid">
               <label>제목<input id="f-title" type="text"></label>
               <label>시간 제한(ms)<input id="f-time" type="number" min="100"></label>
@@ -66,6 +78,13 @@
               <label>제약 조건<textarea id="f-constraints" rows="3"></textarea></label>
               <label>힌트<textarea id="f-hints" rows="3"></textarea></label>
             </div>
+
+            <h3>그림 <span id="badge-figures" class="badge"></span></h3>
+            <p class="hint">
+              역할이 <code>spec</code>·<code>rule</code>인 그림은 전사가 비면 풀이가 성립하지
+              않습니다. 좌표축 방향, 인덱스 시작값, 행·열 순서, 간선 방향을 빠짐없이 적으세요.
+            </p>
+            <div id="figures"></div>
 
             <h3>예제</h3>
             <div id="examples"></div>

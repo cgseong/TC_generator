@@ -135,3 +135,54 @@ class TestStaticSite:
         html = client.get("/").text
         assert "http://" not in html
         assert "https://" not in html
+
+
+class TestPdfUpload:
+    PDF = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\ntrailer\n"
+
+    def upload(self, client, slug, content, filename="지문.pdf"):
+        return client.post(
+            f"/api/problems/{slug}/source-pdf",
+            files={"file": (filename, content, "application/pdf")},
+        )
+
+    def test_stores_pdf_under_a_fixed_name(self, client, slug, tmp_path):
+        response = self.upload(client, slug, self.PDF)
+
+        assert response.status_code == 200
+        stored = tmp_path / slug / "assets" / "statement.pdf"
+        assert stored.read_bytes() == self.PDF
+        assert response.json()["source_pdf"] == "statement.pdf"
+
+    def test_client_filename_cannot_escape_the_workspace(self, client, slug, tmp_path):
+        # 업로드된 이름을 경로로 쓰면 작업공간 밖에 파일을 심을 수 있다.
+        self.upload(client, slug, self.PDF, filename="../../evil.pdf")
+
+        assert (tmp_path / slug / "assets" / "statement.pdf").exists()
+        assert not (tmp_path / "evil.pdf").exists()
+
+    def test_rejects_a_file_that_is_not_a_pdf(self, client, slug, tmp_path):
+        response = self.upload(client, slug, b"PK\x03\x04 not a pdf", filename="x.pdf")
+
+        assert response.status_code == 400
+        assert not (tmp_path / slug / "assets" / "statement.pdf").exists()
+
+    def test_rejects_an_oversized_file(self, client, slug, tmp_path):
+        oversized = self.PDF + b"0" * server.MAX_PDF_BYTES
+        response = self.upload(client, slug, oversized)
+
+        assert response.status_code == 413
+        assert not (tmp_path / slug / "assets" / "statement.pdf").exists()
+
+    def test_parse_pdf_requires_an_uploaded_file(self, client, slug):
+        assert client.post(f"/api/problems/{slug}/parse-pdf").status_code == 409
+
+    def test_figures_can_be_corrected_by_hand(self, client, slug):
+        payload = client.put(
+            f"/api/problems/{slug}",
+            json={"figures": [{"ref": "[그림1]", "role": "spec", "description": "좌상단 (1,1)"}]},
+        ).json()
+
+        assert payload["figures"][0]["description"] == "좌상단 (1,1)"
+        # 그림 전사는 풀이의 전제다. 고치면 기존 확정은 무효가 되어야 한다.
+        assert payload["solution_confirmed"] is False

@@ -29,6 +29,17 @@ LABEL_RANDOM = "random"
 LABEL_SCALE = "scale"
 LABEL_ANTI = "anti"
 
+#: 그림이 지문에서 맡는 역할. 삽화와 규칙 정의를 같이 취급하면 안 된다.
+FIGURE_ROLE_DECORATIVE = "decorative"
+FIGURE_ROLE_EXAMPLE = "example_visual"
+FIGURE_ROLE_SPEC = "spec"
+FIGURE_ROLE_RULE = "rule"
+FIGURE_ROLES: frozenset[str] = frozenset(
+    {FIGURE_ROLE_DECORATIVE, FIGURE_ROLE_EXAMPLE, FIGURE_ROLE_SPEC, FIGURE_ROLE_RULE}
+)
+#: 전사가 없으면 풀이가 성립하지 않는 역할들.
+FIGURE_ROLES_CRITICAL: frozenset[str] = frozenset({FIGURE_ROLE_SPEC, FIGURE_ROLE_RULE})
+
 
 @dataclass(frozen=True)
 class Limits:
@@ -67,6 +78,49 @@ class Example:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Example":
         return cls(input=str(data.get("input", "")), output=str(data.get("output", "")))
+
+
+@dataclass(frozen=True)
+class Figure:
+    """지문 속 그림 하나와 그것을 글로 옮긴 내용 (PRD F1-8).
+
+    ``description``이 비어 있으면 그림이 담은 정보는 **아무도 모르는 상태**다.
+    프롬프트는 이 사실을 숨기지 않고 그대로 적어야 한다.
+    """
+
+    ref: str
+    role: str = FIGURE_ROLE_DECORATIVE
+    description: str = ""
+    page: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ref": self.ref,
+            "role": self.role,
+            "description": self.description,
+            "page": self.page,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "Figure":
+        role = str(data.get("role", FIGURE_ROLE_DECORATIVE))
+        return cls(
+            ref=str(data.get("ref", "")),
+            # 모르는 role을 그대로 믿으면 critical 판정이 조용히 빗나간다.
+            role=role if role in FIGURE_ROLES else FIGURE_ROLE_DECORATIVE,
+            description=str(data.get("description", "")),
+            page=int(data.get("page", 0) or 0),
+        )
+
+    @property
+    def is_critical(self) -> bool:
+        """풀이에 필요한 정보를 그림만 담고 있는 경우."""
+        return self.role in FIGURE_ROLES_CRITICAL
+
+    @property
+    def is_unresolved(self) -> bool:
+        """꼭 필요한데 전사가 없는 그림."""
+        return self.is_critical and not self.description.strip()
 
 
 @dataclass(frozen=True)
@@ -109,6 +163,9 @@ class Problem:
     constraints: str = ""
     hints: str = ""
     examples: tuple[Example, ...] = field(default_factory=tuple)
+    figures: tuple[Figure, ...] = field(default_factory=tuple)
+    #: 지문을 PDF로 올린 경우 작업공간 ``assets`` 안의 파일 이름.
+    source_pdf: str = ""
     limits: Limits = field(default_factory=Limits)
     case_plan: CasePlan = field(default_factory=CasePlan)
     interpretation: str = ""
@@ -127,6 +184,8 @@ class Problem:
             "constraints": self.constraints,
             "hints": self.hints,
             "examples": [example.to_dict() for example in self.examples],
+            "figures": [figure.to_dict() for figure in self.figures],
+            "source_pdf": self.source_pdf,
             "limits": self.limits.to_dict(),
             "case_plan": self.case_plan.to_dict(),
             "interpretation": self.interpretation,
@@ -138,6 +197,7 @@ class Problem:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Problem":
         raw_examples: Sequence[Mapping[str, Any]] = data.get("examples", []) or []
+        raw_figures: Sequence[Mapping[str, Any]] = data.get("figures", []) or []
         return cls(
             slug=str(data["slug"]),
             title=str(data.get("title", "")),
@@ -147,6 +207,8 @@ class Problem:
             constraints=str(data.get("constraints", "")),
             hints=str(data.get("hints", "")),
             examples=tuple(Example.from_dict(item) for item in raw_examples),
+            figures=tuple(Figure.from_dict(item) for item in raw_figures),
+            source_pdf=str(data.get("source_pdf", "")),
             limits=Limits.from_dict(data.get("limits", {}) or {}),
             case_plan=CasePlan.from_dict(data.get("case_plan", {}) or {}),
             interpretation=str(data.get("interpretation", "")),
@@ -158,6 +220,11 @@ class Problem:
     def with_changes(self, **changes: Any) -> "Problem":
         """변경된 사본을 돌려준다. 원본은 건드리지 않는다."""
         return replace(self, **changes)
+
+    @property
+    def unresolved_figures(self) -> tuple[Figure, ...]:
+        """풀이에 필요한데 전사가 비어 있는 그림들."""
+        return tuple(figure for figure in self.figures if figure.is_unresolved)
 
     @property
     def is_exportable(self) -> bool:

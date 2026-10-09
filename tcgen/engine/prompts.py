@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from tcgen.models import Problem
 
@@ -18,6 +19,27 @@ _COMMON_RULES = """
 - 지문에 없는 제약을 지어내지 않는다. 모호하면 가장 보수적으로 해석한다.
 - 설명 문장 없이 요구한 형식만 출력한다.
 """.strip()
+
+
+def _figures_block(problem: Problem) -> str:
+    """그림을 글로 옮긴 내용. 전사가 없으면 없다고 적는다.
+
+    그림의 존재 자체를 숨기면 LLM이 지문을 완전한 것으로 착각하고 빈칸을
+    상상으로 메운다. ``_COMMON_RULES``의 '지어내지 않는다'와 같은 취지다.
+    """
+    if not problem.figures:
+        return "[그림 없음]"
+    lines = ["[그림]"]
+    for figure in problem.figures:
+        description = figure.description.strip()
+        body = description or "전사 없음 — 이 그림이 담은 정보는 알 수 없다."
+        lines.append(f"{figure.ref} (역할={figure.role}) {body}")
+    if problem.unresolved_figures:
+        lines.append(
+            "주의: 전사 없는 그림이 있다. 그 그림에만 있는 정보가 필요하면 "
+            "추측하지 말고 가장 보수적으로 해석하라."
+        )
+    return "\n".join(lines)
 
 
 def _problem_block(problem: Problem) -> str:
@@ -43,6 +65,8 @@ def _problem_block(problem: Problem) -> str:
 
 [힌트]
 {problem.hints or "(없음)"}
+
+{_figures_block(problem)}
 
 [제한]
 시간 {problem.limits.time_ms}ms, 메모리 {problem.limits.memory_mb}MB
@@ -79,6 +103,57 @@ def parse_statement(raw_text: str) -> str:
 """.strip()
 
 
+def parse_pdf(pdf_path: Path) -> str:
+    """PDF 지문을 구조화 항목으로 쪼갠다. 그림까지 글로 옮긴다 (PRD F1-7, F1-8).
+
+    텍스트 붙여넣기 경로와 달리 그림을 볼 수 있다. 그림이 담은 정보를 놓치면
+    이후 모든 단계가 같은 오해를 공유하므로, 전사 지침을 구체적으로 준다.
+    """
+    return f"""
+다음 경로의 PDF는 코딩테스트 문제 지문이다. Read 도구로 **모든 페이지**를 읽어라.
+페이지가 많으면 pages 인자로 나눠서 끝까지 읽어라.
+
+경로: {pdf_path}
+
+읽은 뒤 지문을 항목별로 분해해 JSON으로만 답하라.
+
+{_COMMON_RULES}
+
+출력 형식(JSON 객체 하나):
+{{
+  "title": "문제 제목",
+  "statement": "문제 설명 본문. 그림이 있던 자리에는 [그림1]처럼 참조를 남긴다",
+  "input_spec": "입력 형식 설명",
+  "output_spec": "출력 형식 설명",
+  "constraints": "제약 조건(범위를 빠짐없이)",
+  "hints": "힌트 또는 빈 문자열",
+  "time_ms": 2000,
+  "memory_mb": 256,
+  "examples": [{{"input": "예제 입력 원문", "output": "예제 출력 원문"}}],
+  "figures": [
+    {{"ref": "[그림1]", "role": "spec", "page": 1, "description": "그림을 글로 옮긴 내용"}}
+  ]
+}}
+
+그림의 role은 다음 넷 중 하나다.
+- "spec": 입력 형식·좌표계·격자 구조 등 **입력 해석 규칙**을 그림이 정의한다
+- "rule": 연산·이동·판정 **규칙 자체**를 그림이 정의한다
+- "example_visual": 예제를 그림으로 보여줄 뿐 본문·예제와 내용이 겹친다
+- "decorative": 단순 삽화. 없어도 문제를 푸는 데 지장이 없다
+
+description에는 그림을 **보지 못한 사람도 문제를 풀 수 있을 만큼** 적어라.
+특히 다음을 빠뜨리지 마라.
+- 좌표축의 방향(행·열이 어느 쪽으로 증가하는지)
+- 인덱스가 0부터인지 1부터인지
+- 격자·표에 적힌 값과 그 배치 순서
+- 간선의 방향성, 도형 꼭짓점의 순서, 그림에만 적힌 수치
+- 그림의 값이 예제 입력과 어떻게 대응하는지
+
+지문에 시간·메모리 제한이 없으면 time_ms는 2000, memory_mb는 256으로 둔다.
+그림이 하나도 없으면 figures는 빈 배열로 둔다. 원문 줄바꿈을 보존하라.
+""".strip()
+
+
 def interpretation(problem: Problem) -> str:
     """지문 해석 요약. 사람이 확인할 지점을 뽑는다 (PRD F1-4)."""
     return f"""
@@ -93,6 +168,9 @@ def interpretation(problem: Problem) -> str:
   "ambiguities": ["해석이 갈릴 수 있는 지점(동률 처리, 경계 포함 여부, 출력 형식 등)"],
   "assumptions": ["이 해석대로 구현할 때 전제하는 가정"]
 }}
+
+그림에만 있는 정보가 필요한데 전사가 없거나 모호하면, 그 지점을 ambiguities
+맨 앞에 적어라. 사람이 가장 먼저 확인해야 할 항목이다.
 
 {_problem_block(problem)}
 """.strip()
