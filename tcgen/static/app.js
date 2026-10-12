@@ -364,6 +364,21 @@ function bind() {
     await selectProblem(created.slug);
   });
 
+  $("boj-form").onsubmit = guard(async () => {
+    const number = $("boj-number").value.trim();
+    if (!number) return;
+    const created = await api("/api/problems/from-boj", {
+      method: "POST",
+      body: JSON.stringify({ problem_id: Number(number) }),
+    });
+    $("boj-number").value = "";
+    logLocal(`백준 ${number}번을 가져왔습니다 · ${created.source_url}`, "success");
+    // 자동으로 채우지 못한 것들을 먼저 띄운다. selectProblem이 실패하면
+    // 작업공간은 이미 만들어진 채로 경고만 영영 사라진다.
+    (created.notes || []).forEach((note) => logLocal(note, "warn"));
+    await selectProblem(created.slug);
+  });
+
   $("save-button").onclick = guard(saveProblem);
   $("add-example").onclick = guard(async () => {
     $("examples").appendChild(exampleRow({ input: "", output: "" }, collectExamples().length));

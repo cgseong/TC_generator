@@ -20,8 +20,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from tcgen import __version__
-from tcgen.config import MAX_STRESS_ROUNDS
+from tcgen import __version__, boj
+from tcgen.config import BOJ_MAX_PROBLEM_ID, BOJ_MIN_PROBLEM_ID, MAX_STRESS_ROUNDS
 from tcgen.engine.pipeline import Pipeline, PipelineError
 from tcgen.jobs import JobConflict, SessionRegistry, WorkspaceSession
 from tcgen.llm import ClaudeCLI, LLMError
@@ -97,6 +97,12 @@ class ProblemCreate(BaseModel):
     title: str = Field(min_length=1)
 
 
+class BojImportRequest(BaseModel):
+    """백준 수집본에서 문제를 가져오는 요청. 번호 하나면 된다."""
+
+    problem_id: int = Field(ge=BOJ_MIN_PROBLEM_ID, le=BOJ_MAX_PROBLEM_ID)
+
+
 class ProblemUpdate(BaseModel):
     """폼 수정 요청. 수치는 상·하한을 둔다.
 
@@ -161,6 +167,32 @@ def create_app() -> FastAPI:
         problem = Problem(slug=slugify(request.title), title=request.title)
         workspace = create_workspace(problem)
         return _summary(workspace)
+
+    @app.post("/api/problems/from-boj")
+    def post_problem_from_boj(request: BojImportRequest) -> dict[str, Any]:
+        """백준 번호 하나로 작업공간을 만든다.
+
+        수집본은 지문을 섹션 단위로 갖고 있으므로 이 경로에는 LLM 파싱이
+        없다. 대신 자동으로 채우지 못한 것들을 ``notes``로 돌려준다. 빈
+        칸을 알리지 않으면 사람은 다 채워진 줄 안다.
+        """
+        try:
+            workspace, notes = boj.import_into_workspace(request.problem_id)
+        except boj.BojNotFound as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except boj.BojUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except boj.BojError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except OSError as error:
+            raise HTTPException(
+                status_code=500, detail=f"작업공간을 만들지 못했습니다: {error}"
+            ) from error
+        return {
+            **_summary(workspace),
+            "notes": list(notes),
+            "source_url": boj.source_url(request.problem_id),
+        }
 
     @app.get("/api/problems/{slug}")
     def get_problem(slug: str) -> dict[str, Any]:

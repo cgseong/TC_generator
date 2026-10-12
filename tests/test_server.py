@@ -1,5 +1,6 @@
 """로컬 서버 API 테스트."""
 
+import sqlite3
 import threading
 import time
 
@@ -7,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fixtures import make_problem
-from tcgen import server, workspace as workspace_module
+from tcgen import boj, server, workspace as workspace_module
 from tcgen.workspace import create_workspace
 
 
@@ -39,6 +40,57 @@ class TestEnvironment:
         client.post("/api/settings", json={"model": "sonnet"})
         assert client.get("/api/env").json()["model"] == "sonnet"
         client.post("/api/settings", json={"model": None})
+
+
+class TestBojImport:
+    """백준 번호로 문제를 가져오는 경로. 수집본은 작은 가짜로 대신한다."""
+
+    @pytest.fixture
+    def collection(self, tmp_path, monkeypatch):
+        from test_boj import DEFAULT_SECTIONS, SCHEMA, _insert_problem
+
+        db_path = tmp_path / "boj.db"
+        connection = sqlite3.connect(db_path)
+        connection.executescript(SCHEMA)
+        _insert_problem(
+            connection, 1000, sections=DEFAULT_SECTIONS, samples=((1, "1 2\r\n", "3\r\n"),)
+        )
+        connection.close()
+        images = tmp_path / "images"
+        images.mkdir()
+        monkeypatch.setattr(boj, "BOJ_DB_PATH", db_path)
+        monkeypatch.setattr(boj, "BOJ_IMAGES_DIR", images)
+        return db_path
+
+    def test_import_creates_a_filled_workspace(self, client, collection):
+        created = client.post("/api/problems/from-boj", json={"problem_id": 1000}).json()
+        assert created["slug"] == "boj-1000"
+        assert created["source_url"] == "https://www.acmicpc.net/problem/1000"
+
+        problem = client.get("/api/problems/boj-1000").json()["problem"]
+        assert problem["title"] == "A+B"
+        assert problem["statement"] == "두 수를 더하시오."
+        assert problem["examples"] == [{"input": "1 2\n", "output": "3\n"}]
+        assert problem["limits"] == {"time_ms": 2000, "memory_mb": 128, "assumed": False}
+
+    def test_unknown_problem_is_404(self, client, collection):
+        response = client.post("/api/problems/from-boj", json={"problem_id": 31000})
+        assert response.status_code == 404
+
+    def test_out_of_range_number_is_rejected(self, client, collection):
+        assert client.post("/api/problems/from-boj", json={"problem_id": 12}).status_code == 422
+
+    def test_missing_collection_is_503(self, client, tmp_path, monkeypatch):
+        """수집본이 없는 것은 요청의 잘못이 아니다. 404로 뭉개면 번호를 의심한다."""
+        monkeypatch.setattr(boj, "BOJ_DB_PATH", tmp_path / "없음.db")
+        response = client.post("/api/problems/from-boj", json={"problem_id": 1000})
+        assert response.status_code == 503
+        assert "수집본" in response.json()["detail"]
+
+    def test_importing_twice_does_not_overwrite(self, client, collection):
+        first = client.post("/api/problems/from-boj", json={"problem_id": 1000}).json()
+        second = client.post("/api/problems/from-boj", json={"problem_id": 1000}).json()
+        assert first["slug"] != second["slug"]
 
 
 class TestProblemCrud:

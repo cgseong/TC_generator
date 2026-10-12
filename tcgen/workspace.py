@@ -106,6 +106,11 @@ class Workspace:
         return self.assets_dir / SOURCE_PDF_FILE
 
     @property
+    def figures_dir(self) -> Path:
+        """지문 속 그림 파일. ``[그림 N]``이 ``figure-N.*``에 대응한다."""
+        return self.assets_dir / "figures"
+
+    @property
     def solutions_dir(self) -> Path:
         return self.root / "solutions"
 

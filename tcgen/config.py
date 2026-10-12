@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Final
 
@@ -42,3 +43,11 @@ SERVER_PORT: Final[int] = 8765
 
 MEASUREMENT_POLLING: Final[str] = "polling-lowres"
 MEASUREMENT_UNAVAILABLE: Final[str] = "unavailable"
+
+# 백준 수집본 (boj_problems/) — 외부 자산이며 읽기 전용으로만 쓴다.
+BOJ_DIR: Final[Path] = Path(os.environ.get("TCGEN_BOJ_DIR") or PROJECT_ROOT / "boj_problems")
+BOJ_DB_PATH: Final[Path] = BOJ_DIR / "boj_problems.db"
+BOJ_IMAGES_DIR: Final[Path] = BOJ_DIR / "images"
+# 백준 문제 번호 구간. 수집본은 1000~35505이지만 상한은 넉넉히 둔다.
+BOJ_MIN_PROBLEM_ID: Final[int] = 1000
+BOJ_MAX_PROBLEM_ID: Final[int] = 999_999

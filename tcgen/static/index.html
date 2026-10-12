@@ -24,6 +24,15 @@
         <input id="new-problem-title" type="text" placeholder="새 문제 제목" required>
         <button type="submit">추가</button>
       </form>
+      <form id="boj-form" class="inline-form">
+        <input id="boj-number" type="number" min="1000" max="999999" step="1"
+               placeholder="백준 번호 (예: 1000)" required>
+        <button type="submit" class="secondary">백준에서</button>
+      </form>
+      <p class="hint">
+        수집본(<code>boj_problems/</code>)에서 지문·예제·제한을 그대로 읽어 옵니다.
+        LLM 파싱을 거치지 않으므로 옮겨 적다 생기는 오차가 없습니다.
+      </p>
       <ul id="problem-list" class="problem-list"></ul>
     </section>
   </aside>
