@@ -19,3 +19,6 @@ venv/
 
 # 환경변수가 치환되지 않은 채 생성된 Windows 캐시 폴더
 %SystemDrive%/
+
+# 백준 수집본 (1.9GB 외부 자산). 저장소에 넣을 것이 아니다.
+boj_problems/
