@@ -115,6 +115,7 @@ def evaluate_mutant(
 ) -> MutantResult:
     """케이스를 순서대로 먹여 뮤턴트가 잡히는 지점을 찾는다."""
     evaluated = 0
+    comparison = compare.comparison_for(workspace.load_problem())
     for number in case_numbers:
         input_path = workspace.input_path(number)
         expected_path = workspace.output_path(number)
@@ -133,7 +134,7 @@ def evaluate_mutant(
                 verdict=result.verdict.value,
                 note=result.note,
             )
-        if not compare.outputs_match(expected_path.read_bytes(), result.stdout):
+        if not compare.outputs_match(expected_path.read_bytes(), result.stdout, comparison=comparison):
             return MutantResult(
                 name=spec.name,
                 kind=spec.kind,

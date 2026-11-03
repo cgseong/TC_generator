@@ -111,7 +111,7 @@ class TestConfirmationInvalidation:
         assert payload["solution_confirmed"] is False
 
     def test_cosmetic_change_keeps_confirmation(self, client, confirmed_slug):
-        payload = client.put(f"/api/problems/{confirmed_slug}", json={"hints": "메모"}).json()
+        payload = client.put(f"/api/problems/{confirmed_slug}", json={"title": "새 제목"}).json()
         assert payload["solution_confirmed"] is True
 
 

@@ -43,6 +43,8 @@ class JobState:
     result: Any = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
+    done_event: threading.Event = field(default_factory=threading.Event)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
@@ -61,7 +63,7 @@ class WorkspaceSession:
         self.job = JobState()
         self._lock = threading.Lock()
 
-    def start(self, name: str, work: Callable[[threading.Event], Any]) -> None:
+    def start(self, name: str, work: Callable[[threading.Event], Any]) -> JobState:
         with self._lock:
             if self.job.status == STATUS_RUNNING:
                 raise JobConflict(f"'{self.job.name}' 작업이 아직 실행 중입니다.")
@@ -75,6 +77,7 @@ class WorkspaceSession:
                 job.status = status
                 job.result = result
                 job.error = error
+                job.done_event.set()
 
         def runner() -> None:
             try:
@@ -93,6 +96,7 @@ class WorkspaceSession:
                 self.bus.emit(name, f"'{name}' 단계를 마쳤습니다.", LEVEL_SUCCESS)
 
         threading.Thread(target=runner, name=f"job-{self.slug}-{name}", daemon=True).start()
+        return job
 
     def cancel(self) -> bool:
         with self._lock:

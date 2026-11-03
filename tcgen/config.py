@@ -24,7 +24,8 @@ KILL_GRACE_PERIOD_S: Final[float] = 0.5
 TIME_LIMIT_SLACK: Final[float] = 2.0
 
 # 테스트케이스 생성 기본값 (문제마다 UI에서 변경 가능, PRD F2-C6)
-DEFAULT_CASE_COUNT: Final[int] = 25
+DEFAULT_CASE_COUNT: Final[int] = 15
+MIN_CASE_COUNT: Final[int] = 15
 DEFAULT_MAX_INPUT_BYTES: Final[int] = 4 * 1024 * 1024
 DEFAULT_STRESS_ROUNDS: Final[int] = 300
 MAX_STRESS_ROUNDS: Final[int] = 5000
@@ -32,6 +33,16 @@ MAX_STRESS_ROUNDS: Final[int] = 5000
 MIN_STRESS_ROUNDS: Final[int] = 1
 DEFAULT_FIX_ATTEMPTS: Final[int] = 3
 DEFAULT_REINFORCE_ROUNDS: Final[int] = 2
+
+# code-place의 난이도 이름. 점수 구간은 생성기의 내부 평가 기준이다.
+DIFFICULTY_BANDS: Final = (
+    (0, 2, "VeryLow"),
+    (3, 5, "Low"),
+    (6, 9, "Mid"),
+    (10, 12, "High"),
+    (13, 16, "VeryHigh"),
+)
+DIFFICULTY_LEVELS: Final = frozenset(name for _, _, name in DIFFICULTY_BANDS)
 
 # LLM 호출
 LLM_TIMEOUT_S: Final[float] = 600.0

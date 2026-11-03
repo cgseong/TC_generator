@@ -176,6 +176,16 @@ def interpretation(problem: Problem) -> str:
 """.strip()
 
 
+def describe_figure(problem: Problem, ref: str, path: Path) -> str:
+    return f"""Read 도구로 다음 문제 그림을 읽고, 그림 없이도 풀 수 있도록 전사하라.
+경로: {path}
+참조: {ref}
+좌표축·인덱스·행/열·간선 방향·수치·문제 규칙을 빠짐없이 적어라.
+보이지 않는 내용은 추측하지 마라. 출력은 JSON 객체 하나:
+{{"description": "그림을 글로 옮긴 내용"}}
+{_problem_block(problem)}"""
+
+
 def solution(problem: Problem) -> str:
     """정답 코드."""
     return f"""
@@ -256,7 +266,8 @@ def case_generators(problem: Problem) -> str:
 생성한 입력은 제약 조건을 반드시 지켜야 하며, 한 입력의 크기가
 {max_bytes} 바이트를 넘지 않아야 한다.
 
-다음 세 종류를 각각 하나씩 만들어라.
+다음 세 종류를 각각 2~4개씩 만들어라. name은 고유해야 한다.
+같은 종류라도 서로 다른 구체적인 구조·값 분포·결함을 겨냥해야 한다.
 - "random": 제약 범위 전체에서 고르게 뽑는 보통 크기 입력
 - "scale": 제약의 최대 크기에 가까운 대규모 입력(시간 제한을 시험한다)
 - "anti": 흔한 잘못된 풀이를 저격하는 입력(정렬 누락, 경계 미처리, 오버플로우 유발 등)
@@ -314,7 +325,14 @@ def mutants(problem: Problem, solution_source: str) -> str:
 - "mle": 답은 맞지만 메모리를 과도하게 쓰는 코드.
   {problem.limits.memory_mb}MB를 넘도록 짠다.
 
-각 뮤턴트는 예제 입력 정도는 통과할 수도 있어야 한다(너무 노골적으로 망가뜨리지 마라).
+각 뮤턴트에는 결함 하나만 넣어라. 문제에 실제로 해당하는 실수만 골라라.
+WA 결함을 서로 다른 범주에서 고른다: 경계 조건(<=를 <로), 반복 범위(첫/끝 누락),
+초기화(음수인데 0), 동률·중복, 입력 순서 가정, 테스트 간 상태 초기화,
+잘못된 알고리즘/그리디, 자료형·계산(오버플로/실수 비교), 문제별 규칙(방향/끝점/이동).
+파이썬의 임의 정밀도 정수에 존재하지 않는 오버플로를 주장하지 마라.
+flaw에 범주와 구체적인 변경 내용을 적어라. 각 뮤턴트는 문법적으로 유효하고
+작은 정상 입력을 처리해야 한다. 무조건 sleep/무한루프/거대 고정 할당 대신
+입력 크기에 따라 느려지거나 메모리가 늘어나는 실제 비효율 풀이를 작성하라.
 
 {_COMMON_RULES}
 
@@ -392,10 +410,13 @@ def anti_cases(problem: Problem, mutant_source: str, flaw: str) -> str:
 {{
   "cases": [
     {{"label": "이 입력이 무엇을 드러내는지", "input": "입력 원문"}}
-  ]
+  ],
+  "generators": [{{"source": "sys.argv[1] 시드를 받는 파이썬 생성기 코드"}}]
 }}
 
-3개에서 6개 사이로 만들어라. 제약 조건을 반드시 지켜야 한다.
+직접 입력은 3개에서 6개 사이로 만들어라. 제약 조건을 반드시 지켜야 한다.
+TLE·MLE처럼 큰 입력이 필요하면 긴 입력을 직접 쓰지 말고 생성기를 1~2개 작성하라.
+그 외에는 generators를 빈 배열로 둔다. 입력 크기 상한은 {problem.case_plan.max_input_bytes}바이트다.
 
 {_problem_block(problem)}
 

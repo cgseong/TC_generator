@@ -4,6 +4,7 @@
 PRD 수용 기준 AC-2~AC-7을 덮는다.
 """
 
+import json
 import zipfile
 
 import pytest
@@ -18,7 +19,7 @@ from fixtures import (
     mutants_payload,
     slow_mutants_payload,
 )
-from tcgen import exporter
+from tcgen import exporter, problem_export
 from tcgen.engine.pipeline import Pipeline, PipelineError
 from tcgen.workspace import create_workspace
 
@@ -100,7 +101,8 @@ class TestCaseGeneration:
         pipeline.build_solution()
         outcome = pipeline.build_cases()
 
-        assert len(outcome.records) >= 5
+        assert len(outcome.records) >= 15
+        assert {"example", "edge", "random", "scale", "anti"} <= {r.label for r in outcome.records}
         numbers = [record.index for record in outcome.records]
         assert numbers == list(range(1, len(numbers) + 1))
         assert pipeline.workspace.load_cases_index() == outcome.records
@@ -138,6 +140,8 @@ class TestCaseGeneration:
 
         for record in outcome.records:
             assert pipeline.workspace.input_path(record.index).exists()
+        inputs = [pipeline.workspace.input_path(r.index).read_bytes() for r in outcome.records]
+        assert len(inputs) == len(set(inputs))
 
 
 class TestStrength:
@@ -197,15 +201,16 @@ class TestExport:
         result = pipeline.export()
 
         assert not result.has_errors
-        assert exporter.verify_zip(result.zip_path) == ()
+        assert problem_export.verify_problem_zip(result.zip_path) == ()
 
         with zipfile.ZipFile(result.zip_path) as archive:
             names = archive.namelist()
-        assert "info" in names
-        assert "info.json" not in names
-        assert all("/" not in name for name in names)
+            assert json.loads(archive.read("1/problem.json"))["difficulty"] == "VeryLow"
+        assert "1/problem.json" in names
+        assert "info" not in names
+        assert all(name.startswith("1/") for name in names)
         assert sorted(name for name in names if name.endswith(".in")) == sorted(
-            f"{index}.in" for index in range(1, result.case_count + 1)
+            f"1/testcase/{index}.in" for index in range(1, result.case_count + 1)
         )
 
     def test_report_is_written(self, tmp_path):

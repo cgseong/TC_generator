@@ -9,22 +9,26 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import queue
 import threading
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable
+from html import escape
+from typing import Any, AsyncIterator, Callable, Literal
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from tcgen import __version__, boj
-from tcgen.config import BOJ_MAX_PROBLEM_ID, BOJ_MIN_PROBLEM_ID, MAX_STRESS_ROUNDS
+from tcgen import __version__, boj, drive, figure_preview, history, images, problem_export, exporter, workspace as workspace_module
+from tcgen.batch import BatchManager, MAX_BATCH_SIZE
+from tcgen.config import BOJ_MAX_PROBLEM_ID, BOJ_MIN_PROBLEM_ID, MAX_STRESS_ROUNDS, MIN_CASE_COUNT
 from tcgen.engine.pipeline import Pipeline, PipelineError
-from tcgen.jobs import JobConflict, SessionRegistry, WorkspaceSession
-from tcgen.llm import ClaudeCLI, LLMError
+from tcgen.jobs import Cancelled, JobConflict, SessionRegistry, WorkspaceSession
+from tcgen.llm import LLMError, make_cli
+from tcgen.codex import codex_auth_status
 from tcgen.models import CasePlan, Example, Figure, Limits, Problem
 from tcgen.runner.env import probe_environment
 from tcgen.workspace import (
@@ -40,7 +44,12 @@ from tcgen.workspace import (
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
+SETTINGS_PATH = STATIC_DIR.parent.parent / ".tcgen-settings.json"
 _registry = SessionRegistry()
+_batch_managers: dict[Path, BatchManager] = {}
+_batch_lock = threading.Lock()
+_bundle_lock = threading.Lock()
+_settings_lock = threading.RLock()
 
 #: 이 서버를 가리키는 것으로 인정하는 호스트 이름. DNS 리바인딩 방어용이다.
 _ALLOWED_HOSTNAMES: set[str] = {"127.0.0.1", "localhost", "::1"}
@@ -103,6 +112,15 @@ class BojImportRequest(BaseModel):
     problem_id: int = Field(ge=BOJ_MIN_PROBLEM_ID, le=BOJ_MAX_PROBLEM_ID)
 
 
+class CompletionRequest(BaseModel):
+    completed: bool
+
+
+class BatchRequest(BaseModel):
+    problem_ids: list[int] = Field(min_length=1, max_length=MAX_BATCH_SIZE)
+    skip_exported: bool = True
+
+
 class ProblemUpdate(BaseModel):
     """폼 수정 요청. 수치는 상·하한을 둔다.
 
@@ -120,7 +138,7 @@ class ProblemUpdate(BaseModel):
     figures: list[dict[str, Any]] | None = Field(default=None, max_length=30)
     time_ms: int | None = Field(default=None, ge=1, le=60_000)
     memory_mb: int | None = Field(default=None, ge=1, le=4096)
-    case_count: int | None = Field(default=None, ge=1, le=500)
+    case_count: int | None = Field(default=None, ge=MIN_CASE_COUNT, le=500)
     max_input_bytes: int | None = Field(default=None, ge=1, le=64 * 1024 * 1024)
     stress_rounds: int | None = Field(default=None, ge=1, le=MAX_STRESS_ROUNDS)
 
@@ -134,15 +152,36 @@ class SolutionRequest(BaseModel):
 
 
 class SettingsRequest(BaseModel):
-    model: str | None = None
+    provider: Literal["claude", "anthropic", "codex"] | None = None
+    model: str | None = Field(default=None, max_length=200)
+    drive_folder: str | None = Field(default=None, max_length=1000)
 
 
-_settings: dict[str, Any] = {"model": None}
+def _load_settings() -> dict:
+    try:
+        saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        saved = {}
+    saved = saved if isinstance(saved, dict) else {}
+    provider = saved.get("provider", "claude")
+    provider = provider if provider in {"claude", "anthropic", "codex"} else "claude"
+    models = saved.get("models") if isinstance(saved.get("models"), dict) else {}
+    models.setdefault(provider, saved.get("model"))
+    return {"provider": provider, "models": models, "model": models.get(provider),
+            "drive_folder": os.environ.get("TCGEN_DRIVE_FOLDER") or saved.get("drive_folder", "")}
+
+
+_settings: dict[str, Any] = _load_settings()
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="TC_generator", version=__version__)
     app.add_middleware(LocalOnlyGuard)
+
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    @app.get("/index.html", response_class=HTMLResponse, include_in_schema=False)
+    def get_index() -> HTMLResponse:
+        return HTMLResponse(_initial_html(), headers={"Cache-Control": "no-store"})
 
     # ------------------------------------------------------------- 환경·목록
 
@@ -150,13 +189,128 @@ def create_app() -> FastAPI:
     def get_env() -> dict[str, Any]:
         report = probe_environment()
         payload = report.to_dict()
-        payload["model"] = _settings["model"]
+        settings = _llm_settings()
+        payload.update(settings)
+        payload["models"] = _settings.get("models", {settings["provider"]: settings["model"]})
+        if settings["provider"] == "codex":
+            payload["llm_available"] = report.tool("codex").available
+        elif settings["provider"] == "anthropic":
+            try:
+                import anthropic  # noqa: F401
+                payload["llm_available"] = True
+            except ImportError:
+                payload["llm_available"] = False
+        else:
+            payload["llm_available"] = report.tool("claude").available
+        payload["drive_folder"] = _settings["drive_folder"]
+        payload["drive_credentials_available"] = drive.credentials_available()
         return payload
+
+    @app.get("/api/llm-status")
+    def get_llm_status() -> dict:
+        provider = _llm_settings()["provider"]
+        if provider == "codex":
+            return {"provider": provider, **codex_auth_status()}
+        if provider == "anthropic":
+            import os
+            has_key = bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+            try:
+                import anthropic  # noqa: F401
+                pkg_ok = True
+            except ImportError:
+                pkg_ok = False
+            if not pkg_ok:
+                return {"provider": provider, "ready": False,
+                        "message": "anthropic 패키지가 없습니다. `pip install anthropic`을 실행하세요."}
+            if not has_key:
+                return {"provider": provider, "ready": False,
+                        "message": "ANTHROPIC_API_KEY 환경 변수가 없습니다. API 키를 설정하거나 `ant auth login`으로 로그인하세요."}
+            return {"provider": provider, "ready": True,
+                    "message": "Anthropic SDK 준비됨 · API 키 직접 호출 (빠름)"}
+        # 설치 여부만 확인한다. 구독·조직 허용 여부는 실제 요청에서 판정한다.
+        import shutil
+        available = shutil.which("claude") is not None
+        return {"provider": provider, "ready": available,
+                "message": "Claude CLI 설치됨 · `claude auth status`로 로그인 상태를 확인하세요. 구독과 조직 사용 허용이 필요합니다."
+                if available else "Claude CLI가 없습니다. 설치 후 `claude auth login`으로 로그인해 주세요."}
 
     @app.post("/api/settings")
     def update_settings(request: SettingsRequest) -> dict[str, Any]:
-        _settings["model"] = request.model or None
-        return {"model": _settings["model"]}
+        with _settings_lock:
+            updated = dict(_settings)
+            old_provider = updated.get("provider", "claude")
+            provider = request.provider or old_provider
+            models = dict(updated.get("models", {}))
+            models.setdefault(old_provider, updated.get("model"))
+            if "model" in request.model_fields_set:
+                models[provider] = request.model.strip() or None if request.model else None
+            updated.update(provider=provider, models=models, model=models.get(provider))
+            if request.drive_folder is not None:
+                try:
+                    updated["drive_folder"] = drive.folder_id(request.drive_folder) if request.drive_folder else ""
+                except drive.DriveError as error:
+                    raise HTTPException(status_code=400, detail=str(error)) from error
+            staging = SETTINGS_PATH.with_suffix(".part")
+            staging.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+            staging.replace(SETTINGS_PATH)
+            _settings.update(updated)
+            return dict(updated)
+
+    @app.get("/api/boj")
+    def get_boj_list(q: str = Query(default="", max_length=200),
+                     offset: int = Query(default=0, ge=0),
+                     limit: int = Query(default=10, ge=1, le=200)) -> dict:
+        try:
+            return _annotate_catalog(boj.list_problems(q, offset=offset, limit=limit))
+        except boj.BojUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+    @app.put("/api/boj/{problem_id}/completion")
+    def put_completion(problem_id: int, request: CompletionRequest) -> dict:
+        try:
+            item = boj.catalog_entries([problem_id])[0]
+        except boj.BojNotFound as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except boj.BojError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        return history.set_completion(workspace_module.WORKSPACES_DIR, problem_id,
+                                      request.completed, title=item["title"])
+
+    @app.get("/api/boj/{problem_id}")
+    def get_boj_preview(problem_id: int) -> dict:
+        try:
+            imported = boj.load_boj_problem(problem_id)
+        except boj.BojNotFound as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except boj.BojUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except boj.BojError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        try:
+            preview = figure_preview.prepare(imported, _settings["drive_folder"])
+        except (ValueError, OSError) as error:
+            preview = {"status": "failed", "error": str(error), "images": {}, "key": ""}
+        notes = _figure_notes(imported.notes, hide_local_warning=bool(_settings["drive_folder"]) or preview["status"] == "ready")
+        return {"problem": imported.problem.to_dict(), "notes": notes,
+                "source_url": boj.source_url(problem_id), "figure_preview": preview}
+
+    @app.get("/api/boj/{problem_id}/figure-preview/{key}")
+    def get_boj_figure_state(problem_id: int, key: str) -> dict:
+        try:
+            return figure_preview.state(problem_id, key)
+        except (ValueError, OSError, WorkspaceError) as error:
+            raise HTTPException(status_code=404, detail="그림 미리보기를 찾지 못했습니다.") from error
+
+    @app.get("/api/boj/{problem_id}/figure-preview/{key}/{number}")
+    def get_boj_figure(problem_id: int, key: str, number: int) -> FileResponse:
+        try:
+            cached = figure_preview.workspace(problem_id, key)
+            path = images.find(cached, number) if 1 <= number <= 50 else None
+        except (ValueError, OSError, WorkspaceError) as error:
+            raise HTTPException(status_code=404, detail="그림을 찾지 못했습니다.") from error
+        if path is None:
+            raise HTTPException(status_code=404, detail="그림을 아직 받지 못했습니다.")
+        return FileResponse(path, headers={"Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'; sandbox"})
 
     @app.get("/api/problems")
     def get_problems() -> list[dict[str, Any]]:
@@ -166,6 +320,7 @@ def create_app() -> FastAPI:
     def post_problem(request: ProblemCreate) -> dict[str, Any]:
         problem = Problem(slug=slugify(request.title), title=request.title)
         workspace = create_workspace(problem)
+        history.record(workspace)
         return _summary(workspace)
 
     @app.post("/api/problems/from-boj")
@@ -188,10 +343,18 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=500, detail=f"작업공간을 만들지 못했습니다: {error}"
             ) from error
+        history.record(workspace)
+        copied = figure_preview.copy_cached(workspace.load_problem(), _settings["drive_folder"], workspace)
+        expected = len(workspace.load_problem().figures)
+        ready = all(images.find(workspace, n) for n in range(1, expected + 1))
+        queued = bool(_settings["drive_folder"] and expected and not ready)
+        if queued:
+            _launch_drive_images(workspace.slug)
         return {
             **_summary(workspace),
-            "notes": list(notes),
+            "notes": _figure_notes(notes, hide_local_warning=bool(copied or queued)),
             "source_url": boj.source_url(request.problem_id),
+            "image_download": _image_download_state(workspace, _session(workspace.slug).job.to_dict()),
         }
 
     @app.get("/api/problems/{slug}")
@@ -202,15 +365,27 @@ def create_app() -> FastAPI:
             "problem": workspace.load_problem().to_dict(),
             "cases": [record.to_dict() for record in workspace.load_cases_index()],
             "job": session.job.to_dict(),
+            "image_download": _image_download_state(workspace, session.job.to_dict()),
             "report": _report_text(workspace),
             "has_zip": _zip_path(workspace).exists(),
+            "results": _run_results(workspace),
+            "images": {str(number): f"/api/problems/{slug}/figures/{number}"
+                       for number in range(1, len(workspace.load_problem().figures) + 1)
+                       if images.find(workspace, number)},
         }
 
     @app.put("/api/problems/{slug}")
     def put_problem(slug: str, request: ProblemUpdate) -> dict[str, Any]:
+        _ensure_idle(slug)
         workspace = _workspace(slug)
-        updated = _apply_update(workspace.load_problem(), request)
+        before = workspace.load_problem()
+        updated = _apply_update(before, request)
         workspace.save_problem(updated)
+        if _solution_inputs_changed(before, updated, request.model_dump(exclude_none=True)):
+            _invalidate_results(workspace, problem_changed=True)
+        elif before.case_plan != updated.case_plan or before.title != updated.title:
+            _invalidate_results(workspace)
+        history.record(workspace)
         return updated.to_dict()
 
     # ----------------------------------------------------------------- 단계
@@ -226,6 +401,7 @@ def create_app() -> FastAPI:
         업로드된 파일 이름은 쓰지 않는다. 작업공간 안의 고정된 이름으로만
         저장해야 경로 조작과 예측 불가능한 ``--add-dir`` 범위를 둘 다 막는다.
         """
+        _ensure_idle(slug)
         workspace = _workspace(slug)
         workspace.assets_dir.mkdir(parents=True, exist_ok=True)
         await _store_pdf(file, workspace.source_pdf_path)
@@ -235,23 +411,50 @@ def create_app() -> FastAPI:
         workspace.save_problem(problem)
         return {"source_pdf": problem.source_pdf, "bytes": workspace.source_pdf_path.stat().st_size}
 
+    @app.post("/api/problems/{slug}/figures/{number}")
+    async def post_figure(slug: str, number: int, file: UploadFile) -> dict:
+        _ensure_idle(slug)
+        workspace = _workspace(slug)
+        problem = workspace.load_problem()
+        if not 1 <= number <= min(30, len(problem.figures) + 1):
+            raise HTTPException(status_code=400, detail="기존 그림 번호 또는 바로 다음 번호를 선택하세요.")
+        data = await file.read(boj.MAX_FIGURE_BYTES + 1)
+        try:
+            images.store(workspace, number, data)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        figures = list(problem.figures)
+        if number > len(figures):
+            figures.append(Figure(ref=boj.figure_ref(number), role="spec"))
+        else:
+            figures[number - 1] = Figure(ref=figures[number - 1].ref, role=figures[number - 1].role)
+        workspace.save_problem(problem.with_changes(figures=tuple(figures), solution_confirmed=False))
+        _invalidate_results(workspace, problem_changed=True)
+        return {"number": number, "url": f"/api/problems/{slug}/figures/{number}"}
+
+    @app.get("/api/problems/{slug}/figures/{number}")
+    def get_figure(slug: str, number: int) -> FileResponse:
+        if not 1 <= number <= 50:
+            raise HTTPException(status_code=404, detail="그림이 없습니다.")
+        path = images.find(_workspace(slug), number)
+        if path is None:
+            raise HTTPException(status_code=404, detail="그림이 없습니다.")
+        return FileResponse(path, headers={"Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'; sandbox"})
+
+    @app.post("/api/problems/{slug}/describe-figures")
+    def post_describe_figures(slug: str) -> dict:
+        return _launch(slug, "describe-figures", lambda pipeline: pipeline.describe_figures())
+
+    @app.post("/api/problems/{slug}/drive-images")
+    def post_drive_images(slug: str) -> dict:
+        return _launch_drive_images(slug)
+
     @app.post("/api/problems/{slug}/parse-pdf")
     def post_parse_pdf(slug: str) -> dict[str, str]:
         workspace = _workspace(slug)
         if not workspace.source_pdf_path.is_file():
             raise HTTPException(status_code=409, detail="PDF 지문을 먼저 올려 주세요.")
         return _launch(slug, "parse-pdf", lambda pipeline: pipeline.parse_pdf())
-
-    @app.post("/api/problems/{slug}/interpret")
-    def post_interpret(slug: str) -> dict[str, str]:
-        return _launch(slug, "interpret", lambda pipeline: pipeline.interpret())
-
-    @app.post("/api/problems/{slug}/confirm-interpretation")
-    def post_confirm(slug: str) -> dict[str, Any]:
-        workspace = _workspace(slug)
-        problem = workspace.load_problem().with_changes(interpretation_confirmed=True)
-        workspace.save_problem(problem)
-        return problem.to_dict()
 
     @app.post("/api/problems/{slug}/solution")
     def post_solution(slug: str, request: SolutionRequest) -> dict[str, str]:
@@ -269,18 +472,28 @@ def create_app() -> FastAPI:
     def post_strength(slug: str) -> dict[str, str]:
         return _launch(slug, "strength", lambda pipeline: pipeline.verify_strength().to_dict())
 
+    @app.post("/api/problems/{slug}/final")
+    def post_final(slug: str) -> dict[str, str]:
+        return _launch(slug, "final", lambda pipeline: pipeline.verify_final())
+
+    @app.post("/api/problems/{slug}/export-metadata")
+    def post_export_metadata(slug: str) -> dict:
+        return _launch(slug, "export-metadata", lambda pipeline: pipeline.prepare_export_metadata())
+
     @app.post("/api/problems/{slug}/export")
     def post_export(slug: str) -> dict[str, str]:
         def work(pipeline: Pipeline) -> dict[str, Any]:
             result = pipeline.export()
             pipeline.write_report()
+            if result.has_errors:
+                raise PipelineError("zip 검증에 실패했습니다. 리포트를 확인해 주세요.")
             return result.to_dict()
 
         return _launch(slug, "export", work)
 
     @app.post("/api/problems/{slug}/run-all")
-    def post_run_all(slug: str) -> dict[str, str]:
-        return _launch(slug, "run-all", lambda pipeline: pipeline.run_all())
+    def post_run_all(slug: str, request: SolutionRequest) -> dict[str, str]:
+        return _launch(slug, "run-all", lambda pipeline: pipeline.run_all(request.author_source))
 
     @app.post("/api/problems/{slug}/cancel")
     def post_cancel(slug: str) -> dict[str, bool]:
@@ -320,6 +533,68 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="아직 내보내지 않았습니다.")
         return FileResponse(path, filename=path.name, media_type="application/zip")
 
+    @app.get("/api/history")
+    def get_history() -> dict:
+        root = workspace_module.WORKSPACES_DIR
+        entries = history.snapshot(root, synchronize=True)
+        return {"entries": entries, "by_problem": history.by_problem(root)}
+
+    @app.get("/api/batches/current")
+    def get_batch() -> dict:
+        result = _batch_manager().snapshot()
+        for item in result["items"]:
+            if item["status"] == "running" and item.get("slug"):
+                events = _session(item["slug"]).bus.history()
+                if events:
+                    item["stage"] = events[-1].stage
+                    item["message"] = events[-1].message
+        archives = _batch_archives(result)
+        result["bundle_count"] = len(archives)
+        return result
+
+    @app.get("/api/batches/{batch_id}/download")
+    def get_batch_download(batch_id: str) -> FileResponse:
+        batch = _batch_manager().snapshot()
+        if batch.get("id") != batch_id:
+            raise HTTPException(status_code=404, detail="일괄 실행 기록을 찾지 못했습니다.")
+        archives = _batch_archives(batch)
+        if not archives:
+            raise HTTPException(status_code=404, detail="내보내기를 완료한 문제 zip이 없습니다.")
+        target = workspace_module.WORKSPACES_DIR / f".tcgen-batch-{batch_id}.zip"
+        try:
+            with _bundle_lock:
+                problem_export.bundle(archives, target)
+        except (OSError, exporter.ExportError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return FileResponse(target, filename="problem-export.zip", media_type="application/zip")
+
+    @app.post("/api/batches")
+    def post_batch(request: BatchRequest) -> dict:
+        if len(set(request.problem_ids)) != len(request.problem_ids):
+            raise HTTPException(status_code=422, detail="같은 문제를 중복 선택할 수 없습니다.")
+        if any(not BOJ_MIN_PROBLEM_ID <= number <= BOJ_MAX_PROBLEM_ID for number in request.problem_ids):
+            raise HTTPException(status_code=422, detail="백준 문제 번호 범위를 확인해 주세요.")
+        try:
+            problems = boj.catalog_entries(request.problem_ids)
+            history.snapshot(workspace_module.WORKSPACES_DIR, synchronize=True)
+            settings = _llm_settings()
+            def worker(number, cancel, progress, skip):
+                return _execute_batch_item(number, cancel, progress, skip, llm_settings=settings)
+            return _batch_manager().start(problems, worker, skip_exported=request.skip_exported, llm=settings)
+        except JobConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except boj.BojNotFound as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except boj.BojError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+    @app.post("/api/batches/{batch_id}/cancel")
+    def cancel_batch(batch_id: str) -> dict:
+        try:
+            return _batch_manager().cancel(batch_id)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
     # 진짜 API 라우트를 모두 등록한 뒤, 정적 마운트보다 먼저 걸어 둔다.
     # Starlette는 등록 순서대로 매칭하므로 위의 라우트들이 항상 이긴다.
     @app.api_route(
@@ -346,6 +621,205 @@ def create_app() -> FastAPI:
 
 
 # ----------------------------------------------------------------- 내부 도구
+
+
+def _initial_html() -> str:
+    """첫 10개를 HTML에 포함해 별도 fetch·앱 초기화 전에도 목록을 보여 준다."""
+    template = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    try:
+        page = _annotate_catalog(boj.initial_catalog_page())
+        items = "".join(
+            f'<li class="catalog-row"><input type="checkbox" data-select-id="{item["problem_id"]}" '
+            f'aria-label="{item["problem_id"]} 선택">'
+            f'<button type="button" data-boj-id="{item["problem_id"]}">'
+            f'{item["problem_id"]} · {escape(item["title"] or "제목 없음")}'
+            f'{"<span class=export-done>✓ 내보내기 완료</span>" if (item.get("history") or {}).get("completed") else ""}</button></li>'
+            for item in page["items"]
+        )
+        status = f'1–{len(page["items"])}개' if page["items"] else "수집본에 문제가 없습니다."
+        template = template.replace(
+            '<ul id="catalog-list" class="problem-list catalog-list" data-initial-page=""></ul>',
+            '<ul id="catalog-list" class="problem-list catalog-list" '
+            f'data-initial-page="{escape(json.dumps(page, ensure_ascii=False), quote=True)}">{items}</ul>',
+        )
+        if page["has_more"]:
+            template = template.replace('id="catalog-next" class="secondary" disabled',
+                                        'id="catalog-next" class="secondary"')
+    except boj.BojError as error:
+        status = escape(str(error))
+    template = template.replace("문제 목록을 불러오는 중입니다…", status)
+    provider = _llm_settings()["provider"]
+    template = template.replace(f'<option value="{provider}">', f'<option value="{provider}" selected>')
+    # HTML과 예전 JS가 섞여 초기화가 실패하지 않도록 파일 변경 시 자산 URL도 바꾼다.
+    for asset in ("app.js", "style.css"):
+        version = (STATIC_DIR / asset).stat().st_mtime_ns
+        template = template.replace(f'"{asset}"', f'"{asset}?v={version}"')
+    return template
+
+
+def _annotate_catalog(page: dict) -> dict:
+    records = history.by_problem(workspace_module.WORKSPACES_DIR,
+                                 problem_ids=[item["problem_id"] for item in page["items"]])
+    return {**page, "items": [{**item, "history": records.get(str(item["problem_id"]))} for item in page["items"]]}
+
+
+def _batch_archives(batch: dict) -> list[Path]:
+    paths = []
+    for item in batch.get("items", []):
+        if item["status"] in {"exported", "skipped"} and item.get("slug"):
+            try:
+                path = problem_export.destination(open_workspace(item["slug"]))
+                if path.is_file() and path not in paths:
+                    paths.append(path)
+            except WorkspaceError:
+                continue
+    return paths
+
+
+def _batch_manager() -> BatchManager:
+    root = workspace_module.WORKSPACES_DIR
+    with _batch_lock:
+        if root not in _batch_managers:
+            _batch_managers[root] = BatchManager(root)
+        return _batch_managers[root]
+
+
+def _execute_batch_item(number: int, cancel: threading.Event, progress: Callable, skip_exported: bool,
+                        *, llm_settings: dict | None = None) -> dict:
+    root = workspace_module.WORKSPACES_DIR
+    entries = [entry for entry in history.snapshot(root) if entry.get("boj_id") == number]
+    complete = history.by_problem(root, problem_ids=[number]).get(str(number))
+    if skip_exported and complete and complete["completed"]:
+        slug = complete.get("slug", "")
+        has_zip = bool(slug and _zip_path(open_workspace(slug)).is_file())
+        return {"status": "skipped", "slug": slug, "has_zip": has_zip,
+                "message": "사용자가 완료로 표시한 문제" if complete["completion_source"] == "manual" else "이미 내보내기 완료"}
+    previous = next((entry for entry in entries if not entry["exported"] and (root / entry["slug"] / "problem.json").is_file()), None)
+    if previous:
+        workspace = open_workspace(previous["slug"])
+    else:
+        workspace, _ = boj.import_into_workspace(number)
+        figure_preview.copy_cached(workspace.load_problem(), _settings["drive_folder"], workspace)
+        history.record(workspace)
+    progress(slug=workspace.slug, stage="prepare")
+    session = _session(workspace.slug)
+
+    def work(local_cancel):
+        history.record(workspace, stage="batch", status="running")
+        try:
+            if cancel.is_set():
+                raise Cancelled()
+            problem = workspace.load_problem()
+            if not all((problem.statement.strip(), problem.input_spec.strip(), problem.output_spec.strip())):
+                raise PipelineError("수집본에 문제·입력·출력 설명이 비어 있습니다. 작업을 열어 직접 보완해 주세요.")
+            missing = any(not images.find(workspace, n) for n in range(1, len(problem.figures) + 1))
+            if missing and _settings["drive_folder"]:
+                progress(stage="images", message="Drive에서 그림을 가져오는 중입니다.")
+                _fetch_drive(workspace)
+            if cancel.is_set() or local_cancel.is_set():
+                raise Cancelled()
+            pipeline = (_build_pipeline(workspace, session, local_cancel, settings=llm_settings)
+                        if llm_settings is not None else _build_pipeline(workspace, session, local_cancel))
+            problem = workspace.load_problem()
+            author = (workspace.solution_path.read_text(encoding="utf-8")
+                      if problem.solution_source == "author" and workspace.solution_path.exists() else None)
+            result = pipeline.run_all(author_source=author, reuse_solution=True)
+            entry = history.record(workspace, stage="export")
+            if not entry["exported"]:
+                raise PipelineError("검증된 내보내기 파일이 없습니다. 리포트를 확인해 주세요.")
+            return result
+        except Cancelled:
+            history.record(workspace, stage="batch", status="cancelled")
+            raise
+        except Exception as error:
+            history.record(workspace, stage="batch", status="failed", error=str(error))
+            raise
+
+    job = session.start("batch", work)
+    cancellation_sent = False
+    while not job.done_event.wait(0.2):
+        if cancel.is_set() and not cancellation_sent:
+            session.cancel()
+            cancellation_sent = True
+    if job.status == "cancelled":
+        raise Cancelled("사용자 요청으로 중단했습니다.")
+    if job.status != "done":
+        raise RuntimeError(job.error)
+    return {"status": "exported", "slug": workspace.slug, "has_zip": True, "message": "최종 검증·문제 내보내기 완료"}
+
+
+def _ensure_idle(slug: str) -> None:
+    if _session(slug).job.to_dict()["running"]:
+        raise HTTPException(status_code=409, detail="작업이 실행 중입니다. 끝난 뒤 수정해 주세요.")
+
+
+def _remove_zip(workspace: Workspace) -> None:
+    problem_export.remove_archives(workspace)
+
+
+def _invalidate_results(workspace: Workspace, *, problem_changed: bool = False) -> None:
+    _remove_zip(workspace)
+    (workspace.reports_dir / "report.md").unlink(missing_ok=True)
+    path = workspace.reports_dir / "run.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    keys = ("cases", "strength", "final", "export", "export_metadata")
+    if problem_changed:
+        keys += ("stress", "examples")
+        workspace.clear_cases()
+    for key in keys:
+        payload.pop(key, None)
+    payload["problem"] = workspace.load_problem().to_dict()
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _run_results(workspace: Workspace) -> dict:
+    path = workspace.reports_dir / "run.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {key: payload.get(key) for key in ("stress", "cases", "strength", "final", "export", "export_metadata")}
+
+
+def _fetch_drive(workspace: Workspace) -> dict:
+    result = drive.fetch_figures(workspace, _settings["drive_folder"])
+    if result["downloaded"]:
+        _invalidate_results(workspace, problem_changed=True)
+    return result
+
+
+def _figure_notes(notes, *, hide_local_warning: bool) -> list[str]:
+    # 이 문구는 로컬 수집본 검사 결과다. Drive 요청의 성공/실패와 혼동시키지 않는다.
+    return [note for note in notes if not (hide_local_warning and note.startswith("지문의 그림은 "))]
+
+
+def _image_download_state(workspace: Workspace, job: dict) -> dict:
+    expected = len(workspace.load_problem().figures)
+    available = sum(bool(images.find(workspace, n)) for n in range(1, expected + 1))
+    status = "none" if not expected else "ready" if available == expected else (
+        "downloading" if job["name"] == "drive-images" and job["running"] else
+        "failed" if job["name"] == "drive-images" and job["status"] == "failed" else "missing")
+    return {"status": status, "available": available, "expected": expected,
+            "error": job.get("error", "") if status == "failed" else ""}
+
+
+def _launch_drive_images(slug: str) -> dict:
+    workspace, session = _workspace(slug), _session(slug)
+
+    def work(cancel):
+        session.bus.emit("drive-images", "Drive에서 이 문제의 그림을 가져오는 중입니다.")
+        result = _fetch_drive(workspace)
+        session.bus.emit("drive-images", f"그림 다운로드 완료: {result['downloaded']}개, 기존 그림 {result['cached']}개")
+        return result
+
+    try:
+        session.start("drive-images", work)
+    except JobConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {"status": "started", "stage": "drive-images"}
 
 
 async def _store_pdf(file: UploadFile, destination: Path) -> None:
@@ -405,13 +879,21 @@ def _launch(
 ) -> dict[str, str]:
     workspace = _workspace(slug)
     session = _session(slug)
+    settings = _llm_settings()
 
     def job(cancel_event: threading.Event) -> Any:
-        pipeline = _build_pipeline(workspace, session, cancel_event)
+        history.record(workspace, stage=name, status="running")
         try:
-            return work(pipeline)
-        except (PipelineError, LLMError) as error:
-            raise RuntimeError(str(error)) from error
+            pipeline = _build_pipeline(workspace, session, cancel_event, settings=settings)
+            result = work(pipeline)
+            history.record(workspace, stage=name, status="done" if name not in {"export", "run-all"} else None)
+            return result
+        except Cancelled:
+            history.record(workspace, stage=name, status="cancelled")
+            raise
+        except Exception as error:
+            history.record(workspace, stage=name, status="failed", error=str(error))
+            raise
 
     try:
         session.start(name, job)
@@ -420,10 +902,23 @@ def _launch(
     return {"status": "started", "stage": name}
 
 
+def _llm_settings() -> dict:
+    with _settings_lock:
+        return {"provider": _settings.get("provider", "claude"), "model": _settings.get("model")}
+
+
 def _build_pipeline(
-    workspace: Workspace, session: WorkspaceSession, cancel_event: threading.Event
+    workspace: Workspace, session: WorkspaceSession, cancel_event: threading.Event,
+    *, settings: dict | None = None,
 ) -> Pipeline:
-    cli = ClaudeCLI(model=_settings["model"], log_dir=workspace.logs_dir)
+    settings = settings if settings is not None else _llm_settings()
+    cli = make_cli(settings["provider"], model=settings.get("model"), log_dir=workspace.logs_dir)
+    _provider_labels = {
+        "codex": "GPT (ChatGPT 구독)",
+        "anthropic": "Claude API (직접 호출)",
+        "claude": "Claude 구독",
+    }
+    session.bus.emit("llm", f"사용 AI: {_provider_labels.get(settings['provider'], settings['provider'])} · 모델 {settings.get('model') or '기본값'}")
     return Pipeline(workspace, cli, bus=session.bus, cancel_event=cancel_event)
 
 
@@ -462,6 +957,8 @@ def _summary(workspace: Workspace) -> dict[str, Any]:
     return {
         "slug": problem.slug,
         "title": problem.title,
+        "boj_id": problem.boj_id,
+        "history": history.get(workspace),
         "solution_confirmed": problem.solution_confirmed,
         "interpretation_confirmed": problem.interpretation_confirmed,
         "case_count": len(workspace.load_cases_index()),
@@ -477,6 +974,7 @@ _SOLUTION_CRITICAL_FIELDS = (
     "input_spec",
     "output_spec",
     "constraints",
+    "hints",
     "examples",
     "time_ms",
     "memory_mb",
@@ -535,6 +1033,7 @@ def _solution_inputs_changed(before: Problem, after: Problem, data: dict[str, An
         or before.input_spec != after.input_spec
         or before.output_spec != after.output_spec
         or before.constraints != after.constraints
+        or before.hints != after.hints
         or before.examples != after.examples
         or before.figures != after.figures
         or before.limits != after.limits
@@ -542,7 +1041,7 @@ def _solution_inputs_changed(before: Problem, after: Problem, data: dict[str, An
 
 
 def _zip_path(workspace: Workspace) -> Path:
-    return workspace.export_dir / f"{workspace.slug}_testcases.zip"
+    return problem_export.current_archive(workspace)
 
 
 def _report_text(workspace: Workspace) -> str:

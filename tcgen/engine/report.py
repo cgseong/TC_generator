@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from tcgen import compare
 from tcgen.models import CaseRecord, Problem
 
 REPORT_FILENAME = "report.md"
@@ -31,14 +32,19 @@ def render_report(
     stress: Mapping[str, Any] | None,
     export: Mapping[str, Any] | None,
     environment: Mapping[str, Any] | None,
+    final: Mapping[str, Any] | None = None,
     rejections: Sequence[Mapping[str, str]] = (),
+    export_metadata: Mapping[str, Any] | None = None,
 ) -> str:
     """사람이 읽을 리포트를 만든다."""
     sections = [
         _header(problem),
         _solution_section(problem, stress),
+        "## 출력 비교 기준\n\n" + compare.comparison_for(problem).describe(),
         _cases_section(cases, rejections),
         _strength_section(strength),
+        _final_section(final),
+        _metadata_section(export_metadata),
         _export_section(export),
         _environment_section(environment, strength),
     ]
@@ -62,8 +68,7 @@ def _header(problem: Problem) -> str:
         f"| 시간 제한 | {problem.limits.time_ms}ms"
         f"{' (가정값)' if problem.limits.assumed else ''} |\n"
         f"| 메모리 제한 | {problem.limits.memory_mb}MB"
-        f"{' (가정값)' if problem.limits.assumed else ''} |\n"
-        f"| 지문 해석 확인 | {'완료' if problem.interpretation_confirmed else '**미확인**'} |"
+        f"{' (가정값)' if problem.limits.assumed else ''} |"
     )
 
 
@@ -138,10 +143,23 @@ def _strength_section(strength: Mapping[str, Any] | None) -> str:
         lines.extend(
             [
                 "",
-                "> **생존한 오답 코드가 있습니다.** 이 테스트로는 틀린 제출이 통과합니다. "
-                "추가 케이스를 생성하거나 수동으로 보강하세요.",
+                "> **생존한 오답 코드가 있습니다.** 제한된 보강을 마쳤으며 완료·내보내기는 가능합니다. "
+                "위 결함과 남은 위험을 검토하세요. 동치인 코드일 가능성도 있으므로 kill rate는 정답성의 증명이 아닙니다.",
             ]
         )
+    return "\n".join(lines)
+
+
+def _final_section(final: Mapping[str, Any] | None) -> str:
+    if not final:
+        return "## 최종 브루트포스 대조\n\n아직 수행하지 않았습니다."
+    lines = ["## 최종 브루트포스 대조", "",
+             f"- 입력 검증 {final.get('inputs_validated', 0)}건 / 정답 재실행 출력 검증 {final.get('outputs_verified', 0)}건",
+             f"- 일치 {final['matched']}건 / 실패 {final['failed']}건 / 미검증 {final['skipped']}건",
+             "- 작은 입력 대조와 최종 대조 통과는 정답의 수학적 증명이 아닙니다."]
+    for item in final.get("results", []):
+        if item["status"] != "matched":
+            lines.append(f"- {item['index']}번 ({item['status']}): {item['note']}")
     return "\n".join(lines)
 
 
@@ -184,4 +202,19 @@ def _environment_section(
         note = strength.get("reliability_note", "")
         if note:
             lines.append(f"- {note}")
+    return "\n".join(lines)
+
+
+def _metadata_section(metadata: Mapping[str, Any] | None) -> str:
+    if not metadata:
+        return ""
+    lines = ["## 문제 내보내기 정보", f"- 출처: {metadata.get('source', '')}",
+             f"- 영역: {metadata.get('field_name', '')} ({metadata.get('field', 0)})",
+             f"- 태그: {', '.join(metadata.get('tags', []))}",
+             f"- 난이도: {metadata.get('difficulty', '')} ({metadata.get('difficulty_score', 0)}/16)",
+             f"- 평가 기준: {metadata.get('rubric_version', '')}",
+             f"- 알고리즘: {metadata.get('algorithm', '')}",
+             f"- 사용자용 예제: {len(metadata.get('samples', []))}개 — {metadata.get('sample_note', '')}"]
+    for key, value in metadata.get("assessment", {}).items():
+        lines.append(f"- {key}: {value['score']}/4 — {value['reason']}")
     return "\n".join(lines)

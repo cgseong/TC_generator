@@ -16,6 +16,7 @@ from tcgen.config import (
     DEFAULT_STRESS_ROUNDS,
     DEFAULT_TIME_LIMIT_MS,
     MIN_STRESS_ROUNDS,
+    MIN_CASE_COUNT,
 )
 
 SCHEMA_VERSION = 1
@@ -143,7 +144,7 @@ class CasePlan:
         # 0이나 음수가 들어오면 생성·대조가 조용히 아무것도 하지 않게 된다.
         # 저장된 값이든 API로 들어온 값이든 여기서 하한을 건다.
         return cls(
-            count=max(1, int(data.get("count", DEFAULT_CASE_COUNT))),
+            count=max(MIN_CASE_COUNT, int(data.get("count", DEFAULT_CASE_COUNT))),
             max_input_bytes=max(1, int(data.get("max_input_bytes", DEFAULT_MAX_INPUT_BYTES))),
             stress_rounds=max(
                 MIN_STRESS_ROUNDS, int(data.get("stress_rounds", DEFAULT_STRESS_ROUNDS))
@@ -172,6 +173,7 @@ class Problem:
     interpretation_confirmed: bool = False
     solution_source: str = ""
     solution_confirmed: bool = False
+    boj_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -192,6 +194,7 @@ class Problem:
             "interpretation_confirmed": self.interpretation_confirmed,
             "solution_source": self.solution_source,
             "solution_confirmed": self.solution_confirmed,
+            "boj_id": self.boj_id,
         }
 
     @classmethod
@@ -215,6 +218,7 @@ class Problem:
             interpretation_confirmed=bool(data.get("interpretation_confirmed", False)),
             solution_source=str(data.get("solution_source", "")),
             solution_confirmed=bool(data.get("solution_confirmed", False)),
+            boj_id=int(data["boj_id"]) if data.get("boj_id") is not None else None,
         )
 
     def with_changes(self, **changes: Any) -> "Problem":

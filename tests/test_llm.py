@@ -149,3 +149,59 @@ class TestLogging:
         payload = json.loads(logs[0].read_text(encoding="utf-8"))
         assert payload["prompt"] == "프롬프트"
         assert payload["tag"] == "solution"
+
+
+class TestCliFailureDetails:
+    def test_nonzero_json_reports_actual_result_after_large_metadata(self):
+        payload = {
+            "usage": {"padding": "x" * 1000}, "session_id": "irrelevant-session",
+            "is_error": True, "api_error_status": 403,
+            "api_error_code": "oauth_not_allowed_for_organization",
+            "result": "Your organization has disabled Claude subscription access for Claude Code",
+        }
+        runner = RecordingRunner(fake_completed(json.dumps(payload), returncode=1, stderr="unrelated warning"))
+        with pytest.raises(LLMError) as caught:
+            ClaudeCLI(runner=runner).ask("x")
+        message = str(caught.value)
+        assert "Your organization has disabled" in message
+        assert "HTTP 403" in message and "oauth_not_allowed_for_organization" in message
+        assert "claude auth login" in message
+        assert "irrelevant-session" not in message and "padding" not in message
+
+    @pytest.mark.parametrize("fields, expected", [
+        ({"error": {"message": "server unavailable"}}, "server unavailable"),
+        ({"error": "authentication failed"}, "authentication failed"),
+        ({"errors": ["first error", {"message": "second error"}]}, "first error · second error"),
+    ])
+    def test_alternate_error_shapes(self, fields, expected):
+        runner = RecordingRunner(fake_completed(json.dumps(fields), returncode=1))
+        with pytest.raises(LLMError, match=expected):
+            ClaudeCLI(runner=runner).ask("x")
+
+    def test_failed_call_is_logged_before_exception(self, tmp_path):
+        secret = "sk-ant-verysecretcredential1234567890"
+        payload = {"usage": {"padding": "x" * 21000}, "is_error": True,
+                   "api_error_code": "authentication_error", "api_error_status": 401,
+                   "result": f"Invalid API key: {secret}"}
+        runner = RecordingRunner(fake_completed(json.dumps(payload), returncode=1))
+        with pytest.raises(LLMError) as caught:
+            ClaudeCLI(runner=runner, log_dir=tmp_path).ask("test", tag="failed")
+        assert secret not in str(caught.value)
+        logs = list(tmp_path.glob("*-failed.json"))
+        assert len(logs) == 1
+        log = json.loads(logs[0].read_text())
+        assert log["returncode"] == 1
+        assert "Invalid API key" in log["error"] and "claude auth login" in log["error"]
+        assert secret not in logs[0].read_text()
+
+    def test_zero_exit_error_flag_is_also_logged(self, tmp_path):
+        runner = RecordingRunner(fake_completed(cli_result("permission denied", is_error=True)))
+        with pytest.raises(LLMError):
+            ClaudeCLI(runner=runner, log_dir=tmp_path).ask("x", tag="flag")
+        data = json.loads(next(tmp_path.glob("*-flag.json")).read_text())
+        assert data["error"] == "permission denied"
+
+    def test_non_json_error_still_uses_stderr(self):
+        runner = RecordingRunner(fake_completed("unusable stdout", returncode=1, stderr="actual stderr error"))
+        with pytest.raises(LLMError, match="actual stderr error"):
+            ClaudeCLI(runner=runner).ask("x")

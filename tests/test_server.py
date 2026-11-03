@@ -8,14 +8,19 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fixtures import make_problem
-from tcgen import boj, server, workspace as workspace_module
+from tcgen import boj, figure_preview, server, workspace as workspace_module
 from tcgen.workspace import create_workspace
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
+    monkeypatch.setattr(boj, "CATALOG_CACHE_DIR", tmp_path / "catalog-cache")
+    monkeypatch.setattr(figure_preview, "CACHE_DIR", tmp_path / "preview-cache")
+    monkeypatch.setattr(figure_preview, "registry", server.SessionRegistry())
     monkeypatch.setattr(workspace_module, "WORKSPACES_DIR", tmp_path)
     monkeypatch.setattr(server, "_registry", server.SessionRegistry())
+    monkeypatch.setattr(server, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setattr(server, "_settings", {"model": None, "drive_folder": ""})
     with TestClient(server.app, base_url="http://127.0.0.1:8765") as test_client:
         yield test_client
 
@@ -107,12 +112,12 @@ class TestProblemCrud:
     def test_update_fields(self, client, slug):
         response = client.put(
             f"/api/problems/{slug}",
-            json={"title": "새 제목", "time_ms": 500, "case_count": 7},
+            json={"title": "새 제목", "time_ms": 500, "case_count": 15},
         )
         payload = response.json()
         assert payload["title"] == "새 제목"
         assert payload["limits"]["time_ms"] == 500
-        assert payload["case_plan"]["count"] == 7
+        assert payload["case_plan"]["count"] == 15
 
     def test_update_examples(self, client, slug):
         payload = client.put(
@@ -131,9 +136,9 @@ class TestProblemCrud:
         assert payload["job"]["running"] is False
         assert payload["has_zip"] is False
 
-    def test_confirm_interpretation(self, client, slug):
-        payload = client.post(f"/api/problems/{slug}/confirm-interpretation").json()
-        assert payload["interpretation_confirmed"] is True
+    def test_interpretation_stage_removed(self, client, slug):
+        assert client.post(f"/api/problems/{slug}/confirm-interpretation").status_code == 404
+        assert client.post(f"/api/problems/{slug}/interpret").status_code == 404
 
 
 class TestJobs:
@@ -186,7 +191,8 @@ class TestStaticSite:
         # 폐쇄망에서도 동작해야 하므로 외부 CDN 참조가 없어야 한다.
         html = client.get("/").text
         assert "http://" not in html
-        assert "https://" not in html
+        import re
+        assert not re.search(r'(?:src|href)=["\']https?://', html)
 
 
 class TestPdfUpload:

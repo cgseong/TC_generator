@@ -33,6 +33,7 @@ _PROBED_TOOLS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("javac", ("javac", "-version")),
     ("java", ("java", "-version")),
     ("claude", ("claude", "--version")),
+    ("codex", ("codex", "--version")),
 )
 
 
@@ -64,7 +65,7 @@ class EnvironmentReport:
 
     @property
     def llm_available(self) -> bool:
-        return self.tool("claude").available
+        return self.tool("claude").available or self.tool("codex").available
 
     def tool(self, name: str) -> ToolStatus:
         for status in self.tools:
@@ -120,8 +121,14 @@ def _psutil_status() -> ToolStatus:
 
 
 def _probe_tool(name: str, argv: tuple[str, ...]) -> ToolStatus:
-    if shutil.which(argv[0]) is None:
+    if name == "codex":
+        from tcgen.codex import resolve_codex_executable
+        resolved = resolve_codex_executable()
+    else:
+        resolved = shutil.which(argv[0])
+    if resolved is None:
         return ToolStatus(name=name, available=False, detail="설치되지 않음")
+    argv = (resolved, *argv[1:])
     try:
         completed = subprocess.run(  # noqa: S603 - 버전 확인용 고정 명령
             list(argv),

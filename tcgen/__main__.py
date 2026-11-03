@@ -55,8 +55,10 @@ def _print_environment() -> None:
         print(f"[환경] 설치되지 않은 도구: {', '.join(missing)}")
     if report.skipped_languages:
         print(f"[환경] SKIP되는 언어: {', '.join(report.skipped_languages)}")
-    if not report.llm_available:
-        print("[환경] claude CLI가 없어 LLM 단계를 쓸 수 없습니다.")
+    provider = server._llm_settings()["provider"]
+    print(f"[환경] 선택한 AI: {'GPT (ChatGPT 구독)' if provider == 'codex' else 'Claude 구독'}")
+    if not report.tool(provider).available:
+        print(f"[환경] {provider} CLI가 없어 선택한 AI로 실행할 수 없습니다.")
 
 
 if __name__ == "__main__":

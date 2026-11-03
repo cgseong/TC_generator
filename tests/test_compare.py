@@ -91,3 +91,67 @@ class TestDiagnostics:
 
     def test_clean_output_has_no_findings(self):
         assert compare.lines_with_trailing_space(b"1 2 3\n4 5 6\n") == ()
+
+
+class TestFloatComparison:
+    @staticmethod
+    def policy(text="절대/상대 오차는 10^-6까지 허용한다."):
+        from types import SimpleNamespace
+        return compare.comparison_for(SimpleNamespace(output_spec=text))
+
+    def test_reported_decimal_precision_examples(self):
+        policy = self.policy()
+        assert compare.outputs_match(b"13.341664064126334", b"13.341664064126", comparison=policy)
+        assert compare.outputs_match(b"0.000000000000\n282842.712474619038", b"0.0\n282842.71247461904", comparison=policy)
+        assert not compare.outputs_match(b"13.341664064126334", b"13.341664064126")
+
+    def test_absolute_and_relative_boundaries(self):
+        policy = self.policy()
+        assert compare.outputs_match(b"0.0", b"0.000001", comparison=policy)
+        assert not compare.outputs_match(b"0.0", b"0.000001000001", comparison=policy)
+        assert compare.outputs_match(b"100.0", b"100.0001", comparison=policy)
+        assert not compare.outputs_match(b"100.0", b"100.000100000001", comparison=policy)
+
+    def test_numeric_formatting_changes_are_allowed(self):
+        assert compare.outputs_match(b"1.0000 0.0000", b"1e0\n-0.0", comparison=self.policy())
+
+    def test_incorrect_text_and_token_counts_fail(self):
+        policy = self.policy()
+        assert not compare.outputs_match(b"YES 1.0", b"NO 1.0", comparison=policy)
+        assert not compare.outputs_match(b"1.0 2.0", b"1.0", comparison=policy)
+        assert not compare.outputs_match(b"1.0", b"1.0 extra", comparison=policy)
+        assert not compare.outputs_match(b"1.0", b"nan", comparison=policy)
+        assert not compare.outputs_match(b"inf", b"inf", comparison=policy)
+        assert not compare.outputs_match(b"nan", b"nan", comparison=policy)
+
+    def test_integer_differences_are_never_rounded_away(self):
+        policy = self.policy()
+        assert not compare.outputs_match(b"9007199254740992", b"9007199254740993", comparison=policy)
+        from decimal import Decimal
+        absolute_only = compare.OutputComparison(absolute=Decimal("1e-6"))
+        assert not compare.outputs_match(b"9007199254740992.0", b"9007199254740993.0", comparison=absolute_only)
+
+    def test_no_error_declaration_keeps_exact_comparison(self):
+        assert not self.policy("소수점 아래 12자리까지 출력한다.").tolerant
+        assert not self.policy("정수 하나를 출력한다.").tolerant
+        assert not self.policy("오차는 허용하지 않는다. 절대 오차는 10^-6.").tolerant
+        assert not self.policy("절대 오차는 1/1000000 이하.").tolerant
+
+    def test_korean_english_and_math_error_notations(self):
+        from decimal import Decimal
+        for spec in (
+            "절대/상대 오차는 10^-6까지 허용한다.",
+            "절대 오차 또는 상대 오차가 10^{-6} 이하이면 정답이다.",
+            "절대 또는 상대 오차가 1e-6 이하이다.",
+            "절대/상대 오차는 10⁻⁶ 이내이다.",
+            "absolute or relative error of at most 0.000001 is allowed.",
+            "absolute/relative error must not exceed 1e-6 either.",
+        ):
+            assert self.policy(spec) == compare.OutputComparison(Decimal("1e-6"), Decimal("1e-6")), spec
+        assert self.policy(r"절대 오차는 $2 \times 10^{-7}$ 이하").absolute == Decimal("2e-7")
+
+    def test_distinct_absolute_and_relative_bounds(self):
+        from decimal import Decimal
+        policy = self.policy("절대 오차는 10^-6, 상대 오차는 10^-9까지 허용한다.")
+        assert policy.absolute == Decimal("1e-6")
+        assert policy.relative == Decimal("1e-9")

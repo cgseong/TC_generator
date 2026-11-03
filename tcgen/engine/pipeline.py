@@ -10,20 +10,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from tcgen import exporter
+from tcgen import compare, exporter, history, images, problem_export
 from tcgen.config import (
     DEFAULT_FIX_ATTEMPTS,
     DEFAULT_REINFORCE_ROUNDS,
     MAX_STRESS_ROUNDS,
+    MIN_CASE_COUNT,
 )
-from tcgen.engine import generate, prompts, report, strength
+from tcgen.engine import finalize, generate, metadata, prompts, report, strength
 from tcgen.engine.events import LEVEL_ERROR, LEVEL_SUCCESS, LEVEL_WARN, EventBus
 from tcgen.engine.execution import Executor, SafetyBlocked, write_script
 from tcgen.engine.solution import (
@@ -35,7 +38,7 @@ from tcgen.engine.solution import (
     run_stress,
 )
 from tcgen.jobs import Cancelled
-from tcgen.llm import ClaudeCLI, LLMError
+from tcgen.llm import LLMClient, LLMError
 from tcgen.models import Example, Figure, Limits, Problem
 from tcgen.runner.base import Runner
 from tcgen.runner.env import EnvironmentReport, probe_environment
@@ -45,11 +48,11 @@ from tcgen.workspace import Workspace
 logger = logging.getLogger(__name__)
 
 STAGE_PARSE = "parse"
-STAGE_INTERPRET = "interpret"
 STAGE_SOLUTION = "solution"
 STAGE_CASES = "cases"
 STAGE_STRENGTH = "strength"
 STAGE_EXPORT = "export"
+STAGE_FINAL = "final"
 
 STRESS_GENERATOR_NAME = "stress_gen"
 _GENERATOR_KINDS = ("random", "scale", "anti")
@@ -85,7 +88,7 @@ class Pipeline:
     def __init__(
         self,
         workspace: Workspace,
-        cli: ClaudeCLI,
+        cli: LLMClient,
         *,
         runner: Runner | None = None,
         bus: EventBus | None = None,
@@ -128,9 +131,9 @@ class Pipeline:
         if self.cancel_event is not None and self.cancel_event.is_set():
             raise Cancelled("사용자가 중단을 요청했습니다.")
 
-    def _progress(self, stage: str, message: str) -> None:
+    def _progress(self, stage: str, message: str, **data: Any) -> None:
         self._check_cancel()
-        self.bus.emit(stage, message)
+        self.bus.emit(stage, message, **data)
 
     # ------------------------------------------------------------------ 문제
 
@@ -152,12 +155,12 @@ class Pipeline:
             f"지문 구조화 완료 (예제 {len(updated.examples)}개). 내용을 확인해 주세요.",
             LEVEL_SUCCESS,
         )
-        return self._save(updated)
+        return self._save_parsed(updated)
 
     def parse_pdf(self) -> Problem:
         """PDF 지문을 읽어 구조화 항목과 그림 전사를 채운다 (PRD F1-7).
 
-        그림이 들어간 문제의 유일한 입력 경로다. 텍스트 붙여넣기와 달리 CLI가
+        그림 파일 첨부와 함께 사용할 수 있다. 텍스트 붙여넣기와 달리 CLI가
         파일을 직접 읽으므로, 그림이 담은 정보가 사라지지 않는다.
         """
         pdf_path = self.workspace.source_pdf_path
@@ -192,7 +195,13 @@ class Pipeline:
                 LEVEL_WARN,
                 figures=[figure.to_dict() for figure in unresolved],
             )
-        return self._save(updated)
+        return self._save_parsed(updated)
+
+    def _save_parsed(self, updated: Problem) -> Problem:
+        self._save(updated)
+        self.workspace.clear_cases()
+        self._invalidate("examples", "stress", "cases", "strength", "final", "export")
+        return updated
 
     def _apply_parsed(
         self,
@@ -230,28 +239,6 @@ class Pipeline:
             interpretation_confirmed=False,
         )
 
-    def interpret(self) -> dict[str, Any]:
-        """해석 요약과 모호한 지점을 뽑는다 (PRD F1-4)."""
-        self.bus.emit(STAGE_INTERPRET, "지문 해석을 정리하는 중입니다.")
-        payload = self.cli.ask_json(prompts.interpretation(self.problem), tag="interpret")
-        summary = str(payload.get("summary", ""))
-        self._save(self.problem.with_changes(interpretation=summary))
-        ambiguities = [str(item) for item in payload.get("ambiguities", []) or []]
-        if ambiguities:
-            self.bus.emit(
-                STAGE_INTERPRET,
-                f"확인이 필요한 지점 {len(ambiguities)}건을 찾았습니다.",
-                LEVEL_WARN,
-                ambiguities=ambiguities,
-            )
-        self._state["interpretation"] = payload
-        return payload
-
-    def confirm_interpretation(self) -> Problem:
-        """사람이 해석을 확인했음을 기록한다."""
-        self.bus.emit(STAGE_INTERPRET, "지문 해석을 확인했습니다.", LEVEL_SUCCESS)
-        return self._save(self.problem.with_changes(interpretation_confirmed=True))
-
     # ----------------------------------------------------------------- 정답
 
     def build_solution(
@@ -261,7 +248,12 @@ class Pipeline:
         max_attempts: int = DEFAULT_FIX_ATTEMPTS,
     ) -> SolutionOutcome:
         """정답 코드를 확보하고 브루트포스 대조로 확정한다 (PRD F2-B)."""
+        if self.problem.unresolved_figures:
+            self.describe_figures()
         problem = self.problem
+        self._invalidate("examples", "stress", "cases", "strength", "final", "export")
+        self.workspace.clear_cases()
+        self._save(problem.with_changes(solution_confirmed=False))
         source_kind = "author" if author_source else "llm"
         self._write_solution(author_source or self._ask_solution(problem))
         self._write_helpers(problem)
@@ -285,6 +277,36 @@ class Pipeline:
             level,
         )
         return outcome
+
+    def describe_figures(self) -> dict:
+        problem = self.problem
+        figures = list(problem.figures)
+        changed = 0
+        for number, figure in enumerate(figures, start=1):
+            self._check_cancel()
+            if figure.description.strip():
+                continue
+            path = images.find(self.workspace, number)
+            if path is None:
+                if figure.is_critical:
+                    raise PipelineError(f"{figure.ref} 그림을 첨부하거나 전사를 직접 입력해 주세요.")
+                continue
+            # AVIF 등은 CLI가 직접 읽지 못할 수 있어 PNG로 통일한다.
+            path = images.store(self.workspace, number, path.read_bytes())
+            self.bus.emit(STAGE_PARSE, f"{figure.ref} 그림을 읽는 중입니다.")
+            payload = self.cli.ask_json_about_files(
+                prompts.describe_figure(problem, figure.ref, path), [path], tag=f"figure-{number}",
+            )
+            description = str(payload.get("description", "")).strip()
+            if not description:
+                raise PipelineError(f"{figure.ref} 그림을 읽지 못했습니다. 전사를 직접 입력해 주세요.")
+            figures[number - 1] = Figure(ref=figure.ref, role=figure.role, description=description)
+            changed += 1
+            self._save(problem.with_changes(figures=tuple(figures), solution_confirmed=False))
+        if changed:
+            self.workspace.clear_cases()
+            self._invalidate("examples", "stress", "cases", "strength", "final", "export")
+        return {"described": changed}
 
     def _ask_solution(self, problem: Problem) -> str:
         self.bus.emit(STAGE_SOLUTION, "정답 코드를 생성하는 중입니다.")
@@ -313,6 +335,8 @@ class Pipeline:
 
     def _confirm_loop(self, problem: Problem, max_attempts: int) -> SolutionOutcome:
         rounds = min(problem.case_plan.stress_rounds, MAX_STRESS_ROUNDS)
+        comparison = compare.comparison_for(problem)
+        self.bus.emit(STAGE_SOLUTION, f"출력 비교: {comparison.describe()}")
         examples = ExampleCheck(passed=True)
         stress = StressOutcome(passed=False, rounds_run=0, note="아직 수행하지 않음")
 
@@ -340,11 +364,11 @@ class Pipeline:
                 limits=problem.limits,
                 validator_path=self.workspace.validator_path,
                 on_progress=self._stress_progress,
+                comparison=comparison,
             )
             if stress.passed:
-                return SolutionOutcome(
-                    True, examples, stress, attempt, note=self._determinism_note(problem)
-                )
+                note = self._determinism_note(problem)
+                return SolutionOutcome(not bool(note), examples, stress, attempt, note=note)
 
             self.bus.emit(STAGE_SOLUTION, f"대조 실패: {stress.note or '반례 발견'}", LEVEL_WARN)
             if stress.counterexample is None or not self._apply_fix(
@@ -376,7 +400,13 @@ class Pipeline:
 
     def _apply_fix(self, problem: Problem, counterexample: Counterexample) -> bool:
         """반례를 LLM에 돌려주고 코드를 고친다 (PRD F2-B5)."""
-        self.bus.emit(STAGE_SOLUTION, "반례를 바탕으로 코드를 수정하는 중입니다.")
+        if counterexample.reason.startswith("브루트포스 실행 실패"):
+            self.bus.emit(STAGE_SOLUTION, "브루트포스가 실패해 정답 후보를 자동 수정하지 않습니다.", LEVEL_ERROR)
+            return False
+        saved = self.workspace.reports_dir / "counterexamples.jsonl"
+        with saved.open("a", encoding="utf-8") as sink:
+            sink.write(json.dumps(counterexample.to_dict(), ensure_ascii=False) + "\n")
+        self.bus.emit(STAGE_SOLUTION, "반례를 저장하고 코드를 수정하는 중입니다.")
         current = self.workspace.solution_path.read_text(encoding="utf-8")
         try:
             fixed = self.cli.ask_code(
@@ -405,79 +435,135 @@ class Pipeline:
 
     # --------------------------------------------------------------- 케이스
 
+    def _invalidate(self, *keys: str) -> None:
+        for key in keys:
+            self._state.pop(key, None)
+        if "cases" in keys or "examples" in keys:
+            self._state.pop("export_metadata", None)
+        if "export" in keys:
+            problem_export.remove_archives(self.workspace)
+        self._persist_state()
+
     def build_cases(self) -> generate.GenerationOutcome:
-        """엣지 명시 + 생성기 실행으로 케이스를 만든다 (PRD F2-C)."""
+        """채택된 케이스를 기준으로 유형·생성기별 몫을 나누고 부족분을 재생성한다."""
         problem = self.problem
         if not problem.solution_confirmed:
             raise PipelineError("정답 코드가 확정되지 않아 케이스를 만들 수 없습니다.")
-
+        self._invalidate("cases", "strength", "final", "export")
         self.workspace.clear_cases()
-        self.bus.emit(STAGE_CASES, "경계 케이스를 받아오는 중입니다.")
-        edge_payload = self.cli.ask_json(prompts.edge_cases(problem), tag="edge")
-        candidates = [
-            *generate.candidates_from_examples(problem.examples),
-            *generate.candidates_from_payload(edge_payload, label="edge", origin_prefix="edge"),
-        ]
+        target = max(MIN_CASE_COUNT, problem.case_plan.count)
+        records = []
+        rejections = []
 
-        generated, rejections = self._run_generators(problem, len(candidates))
-        candidates.extend(generated)
+        generated = reviewed = 0
+        last_progress = 0.0
 
-        self.bus.emit(STAGE_CASES, f"후보 {len(candidates)}건을 심사하는 중입니다.")
-        outcome = generate.materialize(
-            self.executor,
-            self.workspace,
-            candidates,
-            self.workspace.solution_path,
-            problem.limits,
-            validator_path=self.workspace.validator_path,
-            on_progress=lambda origin: self._progress(STAGE_CASES, f"심사: {origin}"),
-        )
-        merged = generate.GenerationOutcome(
-            records=outcome.records, rejections=rejections + outcome.rejections
-        )
-        self.workspace.save_cases_index(merged.records)
-        self._state["cases"] = merged.to_dict()
+        def summary(*, force=False):
+            nonlocal last_progress
+            now = time.monotonic()
+            if force or now - last_progress >= 0.5:
+                last_progress = now
+                self._progress(STAGE_CASES, f"케이스 {len(records)}/{target}개 확정 · 제외 {len(rejections)}개",
+                    kind="case_progress", generated=generated, reviewed=reviewed,
+                    accepted=len(records), target=target, rejected=len(rejections))
+
+        def detail(origin, phase):
+            nonlocal generated, reviewed
+            if phase == "generate":
+                generated += 1
+            else:
+                reviewed += 1
+            self._progress(STAGE_CASES, f"{'생성' if phase == 'generate' else '심사'}: {origin}",
+                           kind="case_detail", phase=phase, origin=origin)
+
+        def accept(candidates):
+            outcome = generate.materialize(
+                self.executor, self.workspace, candidates, self.workspace.solution_path,
+                problem.limits, validator_path=self.workspace.validator_path,
+                start_index=len(records) + 1,
+                existing_digests=generate.digests_of(self.workspace, records),
+                on_progress=lambda origin: detail(origin, "review"),
+            )
+            records.extend(outcome.records)
+            rejections.extend(outcome.rejections)
+            summary()
+
+        accept(generate.candidates_from_examples(problem.examples))
+        self.bus.emit(STAGE_CASES, "경계·특수 케이스를 받아오는 중입니다.")
+        payload = self.cli.ask_json(prompts.edge_cases(problem), tag="edge")
+        edges = generate.candidates_from_payload(payload, label="edge", origin_prefix="edge")
+        edge_quota = max(1, target // 4)
+        for candidate in edges:
+            if sum(record.label == "edge" for record in records) >= edge_quota:
+                break
+            if len(records) < target:
+                accept([candidate])
+
+        generators = self._prepare_generators(problem)
+        remaining = max(0, target - len(records))
+        quotas = {kind: remaining // 3 + (index < remaining % 3)
+                  for index, kind in enumerate(_GENERATOR_KINDS)}
+        used = {path: 0 for _, path in generators}
+        # 채택에 실패한 생성기는 제한된 횟수만 재시도한다. 빈 입력 영역을 무한히 돌지 않는다.
+        for wave in range(6):
+            if len(records) >= target:
+                break
+            for kind in _GENERATOR_KINDS:
+                paths = [path for label, path in generators if label == kind]
+                deficit = quotas[kind] - sum(record.label == kind for record in records)
+                # 마지막 두 회차에는 다른 유형의 부족분도 분산해 채운다.
+                if wave >= 4:
+                    deficit = max(deficit, (target - len(records) + 2) // 3)
+                for offset in range(max(0, deficit)):
+                    if not paths or len(records) >= target:
+                        break
+                    path = paths[offset % len(paths)]
+                    used[path] += 1
+                    produced, failed = generate.candidates_from_generator(
+                        self.executor, path, label=kind, seeds=(used[path],),
+                        max_bytes=problem.case_plan.max_input_bytes,
+                        on_progress=lambda origin: detail(origin, "generate"),
+                    )
+                    rejections.extend(failed)
+                    accept(produced)
+
+        summary(force=True)
+        merged = generate.GenerationOutcome(tuple(records), tuple(rejections))
+        self.workspace.save_cases_index(records)
+        self._state["cases"] = {**merged.to_dict(), "target_count": target,
+                                "complete": len(records) >= target,
+                                "distribution": {kind: sum(r.label == kind for r in records)
+                                                 for kind in ("example", "edge", *_GENERATOR_KINDS)}}
         self._persist_state()
-        self.bus.emit(
-            STAGE_CASES,
-            f"케이스 {len(merged.records)}건 확정 (탈락 {len(merged.rejections)}건)",
-            LEVEL_SUCCESS,
-        )
+        complete = len(records) >= target
+        self.bus.emit(STAGE_CASES,
+                      f"케이스 {len(records)}/{target}건 확정 (탈락 {len(rejections)}건)"
+                      + ("" if complete else " · 고유한 유효 입력 부족: 생성기를 보완해야 내보낼 수 있습니다."),
+                      LEVEL_SUCCESS if complete else LEVEL_WARN, kind="case_complete")
         return merged
 
-    def _run_generators(
-        self, problem: Problem, already: int
-    ) -> tuple[list[generate.Candidate], tuple[generate.Rejection, ...]]:
-        self.bus.emit(STAGE_CASES, "생성기 스크립트를 받아오는 중입니다.")
+    def _prepare_generators(self, problem: Problem) -> list[tuple[str, Path]]:
+        self.bus.emit(STAGE_CASES, "유형별 여러 생성기 스크립트를 준비합니다.")
         payload = self.cli.ask_json(prompts.case_generators(problem), tag="generators")
-        remaining = max(len(_GENERATOR_KINDS), problem.case_plan.count - already)
-        candidates: list[generate.Candidate] = []
-        rejections: list[generate.Rejection] = []
-
-        for position, spec in enumerate(payload.get("generators", []) or []):
-            if not isinstance(spec, dict) or not str(spec.get("source", "")).strip():
+        generators = []
+        for position, spec in enumerate((payload.get("generators") or [])[:12]):
+            if not isinstance(spec, dict) or not isinstance(spec.get("source"), str):
                 continue
-            kind = str(spec.get("kind") or spec.get("name") or f"gen{position}")
-            path = self.workspace.gens_dir / f"{_safe_stem(kind, position)}.py"
+            kind = str(spec.get("kind", ""))
+            if kind not in _GENERATOR_KINDS or not spec["source"].strip():
+                continue
+            stem = _safe_stem(str(spec.get("name") or kind), position)
+            path = self.workspace.gens_dir / f"{kind}_{position}_{stem}.py"
             try:
-                self._warn_findings(
-                    STAGE_CASES, path.name, write_script(path, str(spec["source"]))
-                )
+                self._warn_findings(STAGE_CASES, path.name, write_script(path, spec["source"]))
             except SafetyBlocked as error:
-                rejections.append(generate.Rejection(path.name, str(error)))
+                self.bus.emit(STAGE_CASES, str(error), LEVEL_WARN)
                 continue
-            seeds = _seeds_for(position, remaining, len(_GENERATOR_KINDS))
-            produced, failed = generate.candidates_from_generator(
-                self.executor,
-                path,
-                label=kind,
-                seeds=seeds,
-                max_bytes=problem.case_plan.max_input_bytes,
-                on_progress=lambda origin: self._progress(STAGE_CASES, f"생성: {origin}"),
-            )
-            candidates.extend(produced)
-            rejections.extend(failed)
-        return candidates, tuple(rejections)
+            generators.append((kind, path))
+        for kind in _GENERATOR_KINDS:
+            if not any(label == kind for label, _ in generators):
+                self.bus.emit(STAGE_CASES, f"{kind} 생성기가 없어 해당 유형을 생성하지 못합니다.", LEVEL_WARN)
+        return generators
 
     # ----------------------------------------------------------------- 강도
 
@@ -489,6 +575,9 @@ class Pipeline:
         records = self.workspace.load_cases_index()
         if not records:
             raise PipelineError("테스트케이스가 없어 강도를 검증할 수 없습니다.")
+        if not problem.solution_confirmed:
+            raise PipelineError("정답 코드가 확정되지 않아 강도를 검증할 수 없습니다.")
+        self._invalidate("strength", "final", "export")
 
         self.bus.emit(STAGE_STRENGTH, "오답 코드를 생성하는 중입니다.")
         payload = self.cli.ask_json(
@@ -496,15 +585,31 @@ class Pipeline:
             tag="mutants",
         )
         specs, paths = self._write_mutants(strength.specs_from_payload(payload))
-        if not specs:
-            raise PipelineError("쓸 수 있는 오답 코드를 받지 못했습니다.")
+        for retry in range(2):
+            missing = {kind: max(0, required - sum(spec.kind == kind for spec in specs))
+                       for kind, required in (("wa", 4), ("tle", 1), ("mle", 1))}
+            if not any(missing.values()):
+                break
+            self.bus.emit(STAGE_STRENGTH, f"오답 코드 부족분을 추가 요청합니다: {missing}", LEVEL_WARN)
+            payload = self.cli.ask_json(
+                prompts.mutants(problem, self.workspace.solution_path.read_text(encoding="utf-8"))
+                + f"\n추가로 필요한 개수: {missing}. 기존 이름과 겹치지 않게 작성: {[s.name for s in specs]}",
+                tag=f"mutants-fill-{retry + 1}",
+            )
+            specs, paths = self._write_mutants((*specs, *strength.specs_from_payload(payload)))
+        if sum(s.kind == "wa" for s in specs) < 4 or not all(any(s.kind == k for s in specs) for k in ("tle", "mle")):
+            raise PipelineError("안전 검사·중복 제거 후 WA 4개 이상, TLE 1개, MLE 1개가 필요합니다. 오답 코드 생성을 다시 실행해 주세요.")
 
         report_result = self._evaluate(specs, paths, records, problem.limits)
-        for round_index in range(1, reinforce_rounds + 1):
+        for round_index in range(1, min(3, max(0, reinforce_rounds)) + 1):
             if report_result.all_killed:
                 break
+            before_count, before_kills = len(records), sum(r.killed for r in report_result.results)
             records = self._reinforce(problem, report_result, records, round_index)
             report_result = self._evaluate(specs, paths, records, problem.limits)
+            if len(records) == before_count or sum(r.killed for r in report_result.results) == before_kills:
+                self.bus.emit(STAGE_STRENGTH, "보강 효과가 없어 종료합니다. 생존 오답은 리포트에 남깁니다.", LEVEL_WARN)
+                break
 
         self._state["strength"] = report_result.to_dict()
         self._persist_state()
@@ -523,12 +628,15 @@ class Pipeline:
         kept: list[strength.MutantSpec] = []
         paths: list[Path] = []
         used: set[str] = set()
+        sources: set[str] = set()
         for spec in specs:
             stem = f"{spec.kind}_{spec.name}"
-            if stem in used:
+            digest = hashlib.sha256(spec.source.strip().encode()).hexdigest()
+            if stem in used or digest in sources:
                 self.bus.emit(STAGE_STRENGTH, f"이름이 겹치는 오답 코드 제외: {stem}", LEVEL_WARN)
                 continue
             used.add(stem)
+            sources.add(digest)
             path = self.workspace.mutants_dir / f"{stem}.py"
             try:
                 write_script(path, spec.source)
@@ -593,6 +701,21 @@ class Pipeline:
                     payload, label="anti", origin_prefix=f"anti:{survivor.name}"
                 )
             )
+            for position, spec in enumerate((payload.get("generators") or [])[:2]):
+                if not isinstance(spec, dict) or not isinstance(spec.get("source"), str):
+                    continue
+                generator_path = self.workspace.gens_dir / f"reinforce_{survivor.name}_{round_index}_{position}.py"
+                try:
+                    write_script(generator_path, spec["source"])
+                except SafetyBlocked as error:
+                    self.bus.emit(STAGE_STRENGTH, str(error), LEVEL_WARN)
+                    continue
+                produced, _ = generate.candidates_from_generator(
+                    self.executor, generator_path, label="anti", seeds=(1, 2, 3),
+                    max_bytes=problem.case_plan.max_input_bytes,
+                    on_progress=lambda origin: self._progress(STAGE_STRENGTH, f"보강 생성: {origin}"),
+                )
+                candidates.extend(produced)
 
         if not candidates:
             return tuple(records)
@@ -610,6 +733,10 @@ class Pipeline:
         )
         merged = tuple(records) + outcome.records
         self.workspace.save_cases_index(merged)
+        case_state = self._state.setdefault("cases", {})
+        case_state.update(records=[record.to_dict() for record in merged], case_count=len(merged))
+        case_state.setdefault("rejections", []).extend(rejection.to_dict() for rejection in outcome.rejections)
+        self._persist_state()
         self.bus.emit(STAGE_STRENGTH, f"케이스 {len(outcome.records)}건을 보강했습니다.")
         return merged
 
@@ -622,11 +749,23 @@ class Pipeline:
             raise PipelineError(
                 "정답 코드가 확정되지 않아 내보낼 수 없습니다. 브루트포스 대조를 먼저 통과시키세요."
             )
-        destination = self.workspace.export_dir / f"{problem.slug}_testcases.zip"
-        self.bus.emit(STAGE_EXPORT, "zip을 만드는 중입니다.")
-        result = exporter.export_zip(self.workspace.cases_dir, destination)
-        self._state["export"] = result.to_dict()
+        target = max(MIN_CASE_COUNT, problem.case_plan.count)
+        if len(self.workspace.load_cases_index()) < target:
+            raise PipelineError(f"중복 제거·검증 후 최소 {target}개 케이스가 필요합니다.")
+        final = self.verify_final()
+        if not final["passed"]:
+            raise PipelineError("최종 대조가 실패해 내보내기를 중단했습니다. 리포트를 확인하세요.")
+        export_metadata = self.prepare_export_metadata(final_checked=True)
+        destination = problem_export.destination(self.workspace)
+        self.bus.emit(STAGE_EXPORT, "문제 JSON·그림·테스트케이스를 zip으로 묶는 중입니다.")
+        result = problem_export.export_problem(self.workspace, export_metadata)
+        self._state["export"] = {**result.to_dict(), "format": problem_export.FORMAT}
         self._persist_state()
+        if not result.has_errors:
+            try:
+                history.record(self.workspace, stage="export", status="exported", exported=True)
+            except OSError as error:
+                logger.warning("내보내기 이력을 저장하지 못했습니다: %s", error)
 
         for issue in result.issues:
             level = LEVEL_ERROR if issue.severity == exporter.SEVERITY_ERROR else LEVEL_WARN
@@ -638,6 +777,60 @@ class Pipeline:
         )
         return result
 
+    def prepare_export_metadata(self, *, final_checked: bool = False) -> dict:
+        """메타데이터와 예제를 생성·검증해 저장한다. 동일 문제의 분류는 재사용한다."""
+        if not self.problem.solution_confirmed:
+            raise PipelineError("정답 코드를 먼저 확정해 주세요.")
+        if not self.workspace.load_cases_index():
+            raise PipelineError("예제 선정에 사용할 테스트케이스를 먼저 생성해 주세요.")
+        if not final_checked and not self.verify_final(invalidate_export=False)["passed"]:
+            raise PipelineError("최종 검증에 실패해 문제 내보내기 정보를 생성할 수 없습니다.")
+        self._check_cancel()
+        source = self.workspace.solution_path.read_text(encoding="utf-8")
+        progress = lambda message: self._progress(STAGE_EXPORT, message)
+        cache_path = self.workspace.reports_dir / "classification.json"
+        cached = self._state.get("export_metadata")
+        if not cached:
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                cached = None
+        classification = metadata.classify(self.problem, source, self.cli,
+            cached=cached, on_progress=progress,
+            cache_dir=self.workspace.root.parent / ".tcgen-classifications")
+        cache_path.write_text(json.dumps(classification, ensure_ascii=False, indent=2), encoding="utf-8")
+        samples = metadata.select_samples(self.workspace, self.executor, on_progress=progress)
+        result = {**classification, **samples, "source": problem_export.SOURCE}
+        # 그림 누락·필수 항목 오류도 실제 export 전에 확인한다.
+        problem_export.build_payload(self.workspace, result)
+        self._state["export_metadata"] = result
+        self._persist_state()
+        self.write_report()
+        return result
+
+    def verify_final(self, *, invalidate_export: bool = True) -> dict[str, Any]:
+        if not self.problem.solution_confirmed:
+            raise PipelineError("정답 코드가 확정되지 않아 최종 검증할 수 없습니다.")
+        if invalidate_export:
+            self._invalidate("final", "export")
+        else:
+            self._invalidate("final")
+        result = finalize.verify_cases(
+            self.executor, self.workspace,
+            on_progress=lambda message: self._progress(STAGE_FINAL, message),
+        )
+        self._state["final"] = result
+        if not result["passed"]:
+            self._state.pop("export", None)
+            problem_export.remove_archives(self.workspace)
+        self._persist_state()
+        self.bus.emit(STAGE_FINAL,
+                      f"입력 검증 {result['inputs_validated']}건 · 정답 출력 재검증 {result['outputs_verified']}건 · "
+                      f"최종 대조: 일치 {result['matched']}, 실패 {result['failed']}, 미검증 {result['skipped']}",
+                      LEVEL_ERROR if not result["passed"] else (LEVEL_WARN if result["skipped"] else LEVEL_SUCCESS))
+        self.write_report()
+        return result
+
     def write_report(self) -> Path:
         """리포트를 기록한다 (PRD NF-R3)."""
         cases = self.workspace.load_cases_index()
@@ -646,6 +839,8 @@ class Pipeline:
             cases=cases,
             strength=self._state.get("strength"),
             stress=self._state.get("stress"),
+            final=self._state.get("final"),
+            export_metadata=self._state.get("export_metadata"),
             export=self._state.get("export"),
             environment=self.environment.to_dict(),
             rejections=(self._state.get("cases") or {}).get("rejections", ()),
@@ -659,28 +854,34 @@ class Pipeline:
         return {
             "problem": self.problem.to_dict(),
             "environment": self.environment.to_dict(),
+            "llm": {"provider": getattr(self.cli, "provider", "test"), "model": getattr(self.cli, "model", None)},
+            "output_comparison": compare.comparison_for(self.problem).to_dict(),
             "examples": self._state.get("examples"),
             "stress": self._state.get("stress"),
             "cases": self._state.get("cases"),
             "strength": self._state.get("strength"),
+            "final": self._state.get("final"),
             "export": self._state.get("export"),
+            "export_metadata": self._state.get("export_metadata"),
         }
 
-    def run_all(self) -> dict[str, Any]:
+    def run_all(self, author_source: str | None = None, *, reuse_solution: bool = False) -> dict[str, Any]:
         """전자동 실행 (전문가 모드)."""
-        if not self.problem.interpretation_confirmed:
-            self.bus.emit(
-                STAGE_INTERPRET,
-                "지문 해석을 사람이 확인하지 않은 채 진행합니다. 리포트에 '미확인'으로 남습니다.",
-                LEVEL_WARN,
-            )
         try:
-            outcome = self.build_solution()
-            if not outcome.confirmed:
-                raise PipelineError("정답 코드를 확정하지 못해 중단했습니다. 리포트를 확인하세요.")
-            self.build_cases()
+            reusable = (reuse_solution and self.problem.solution_confirmed and all(path.is_file() for path in (
+                self.workspace.solution_path, self.workspace.brute_path,
+                self.workspace.validator_path, self._stress_generator_path(),
+            )))
+            if not reusable:
+                outcome = self.build_solution(author_source)
+                if not outcome.confirmed:
+                    raise PipelineError("정답 코드를 확정하지 못해 중단했습니다. 리포트를 확인하세요.")
+            cases = self.build_cases()
+            if len(cases.records) < max(MIN_CASE_COUNT, self.problem.case_plan.count):
+                raise PipelineError("유효한 고유 케이스가 목표 수에 미달해 중단했습니다. 생성 결과를 확인하세요.")
             self.verify_strength()
-            self.export()
+            if self.export().has_errors:
+                raise PipelineError("zip 검증에 실패했습니다. 내보내기 리포트를 확인하세요.")
         finally:
             # 중간에 실패해도 그때까지의 증거는 남겨야 한다 (PRD NF-R2, NF-R3).
             self.write_report()

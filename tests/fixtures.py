@@ -195,6 +195,12 @@ def mutants_payload(*, sneaky: bool = False) -> dict:
         {"name": "subtract", "kind": "wa", "flaw": "더하기 대신 빼기", "source": MUTANT_SUBTRACT},
         {"name": "offbyone", "kind": "wa", "flaw": "1을 더 더함", "source": MUTANT_OFF_BY_ONE},
     ]
+    mutants.extend([
+        {"name": "zero", "kind": "wa", "flaw": "같은 값 경계 처리 오류", "source": SOLUTION.replace("print(a + b)", "print(a + b + (a == b))")},
+        {"name": "bound", "kind": "wa", "flaw": "최대값 경계", "source": SOLUTION.replace("print(a + b)", "print(a + b - (a == 1000))")},
+        {"name": "slow", "kind": "tle", "flaw": "입력 값에 비례하는 불필요한 반복", "source": MUTANT_SLOW.replace("60_000_000", "80_000 * max(a, b)")},
+        {"name": "hungry", "kind": "mle", "flaw": "입력 값에 비례하는 거대한 리스트", "source": MUTANT_HUNGRY.replace("40 * 1024 * 1024", "50_000 * max(a, b)")},
+    ])
     if sneaky:
         mutants.append(
             {
@@ -210,6 +216,7 @@ def mutants_payload(*, sneaky: bool = False) -> dict:
 def slow_mutants_payload() -> dict:
     return {
         "mutants": [
+            *[m for m in mutants_payload()["mutants"] if m["kind"] == "wa"],
             {"name": "slow", "kind": "tle", "flaw": "불필요한 반복", "source": MUTANT_SLOW},
             {"name": "hungry", "kind": "mle", "flaw": "거대한 리스트", "source": MUTANT_HUNGRY},
         ]
@@ -273,6 +280,11 @@ def default_responses(**overrides: Any) -> dict[str, Any]:
         "mutants": mutants_payload(),
         "anti": anti_payload(),
         "fix": SOLUTION,
+        "export-metadata": {
+            "field": 1, "field_reason": "두 정수의 덧셈", "tags": ["수학"], "algorithm": "O(1) 덧셈",
+            "assessment": {name: {"score": 0, "reason": "사칙연산만 필요"}
+                           for name in ("knowledge", "insight", "implementation", "complexity")},
+        },
     }
     responses.update(overrides)
     return responses

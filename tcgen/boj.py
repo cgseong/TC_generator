@@ -15,10 +15,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import shutil
 import sqlite3
 import stat
+import tempfile
+import threading
+from collections import OrderedDict
 from contextlib import closing
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -33,12 +38,117 @@ from tcgen.config import (
     BOJ_MIN_PROBLEM_ID,
     DEFAULT_MEMORY_LIMIT_MB,
     DEFAULT_TIME_LIMIT_MS,
+    PROJECT_ROOT,
 )
 from tcgen.models import FIGURE_ROLE_SPEC, Example, Figure, Limits, Problem
 from tcgen.workspace import Workspace, create_workspace
 
 SLUG_PREFIX: Final[str] = "boj-"
 SOURCE_URL: Final[str] = "https://www.acmicpc.net/problem/{problem_id}"
+CATALOG_CACHE_DIR = PROJECT_ROOT / ".tcgen-cache" / "catalog"
+_CATALOG_VERSION = 1
+_CATALOG_FIELDS = ("problem_id", "title", "time_limit", "memory_limit")
+_catalog_lock = threading.Lock()
+_catalogs: OrderedDict = OrderedDict()
+
+
+@dataclass(frozen=True)
+class _Catalog:
+    rows: tuple[tuple, ...]
+    search: tuple[tuple[str, str], ...]
+
+
+def _catalog_stamp(path: Path) -> tuple[int, ...]:
+    """WAL의 미반영 변경도 캐시 무효화에 포함한다. 읽기 때문에 바뀌는 SHM은 제외한다."""
+    try:
+        main = path.stat()
+        if not stat.S_ISREG(main.st_mode):
+            raise FileNotFoundError(path)
+        try:
+            wal = Path(str(path) + "-wal").stat()
+        except FileNotFoundError:
+            wal = None
+    except OSError as error:
+        raise BojUnavailable(f"백준 수집본을 확인하지 못했습니다: {path}") from error
+    wal_stamp = (wal.st_dev, wal.st_ino, wal.st_size, wal.st_mtime_ns) if wal else (0, 0, 0, 0)
+    return (main.st_dev, main.st_ino, main.st_size, main.st_mtime_ns, *wal_stamp)
+
+
+def _read_catalog_cache(cache_path: Path, stamp: tuple[int, ...]) -> tuple | None:
+    try:
+        if cache_path.stat().st_size > 16 * 1024 * 1024:
+            return None
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("version") != _CATALOG_VERSION or data.get("stamp") != list(stamp):
+            return None
+        rows = data["rows"]
+        if not isinstance(rows, list) or not all(
+            isinstance(row, list) and len(row) == 4 and type(row[0]) is int
+            and all(value is None or isinstance(value, str) for value in row[1:])
+            for row in rows
+        ):
+            return None
+        if any(left[0] >= right[0] for left, right in zip(rows, rows[1:])):
+            return None
+        return tuple(tuple(row) for row in rows)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_catalog_cache(cache_path: Path, stamp: tuple[int, ...], rows: tuple) -> None:
+    staging = None
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache_path.parent,
+                                         prefix="catalog-", suffix=".part", delete=False) as sink:
+            staging = Path(sink.name)
+            json.dump({"version": _CATALOG_VERSION, "stamp": stamp, "rows": rows}, sink,
+                      ensure_ascii=False, separators=(",", ":"))
+        staging.replace(cache_path)
+    except OSError:
+        # 캐시 저장 권한이 없어도 원본 DB에서 읽은 목록은 사용할 수 있다.
+        pass
+    finally:
+        if staging is not None:
+            try:
+                staging.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _get_catalog(db_path: Path | None) -> _Catalog:
+    path = (Path(db_path) if db_path is not None else BOJ_DB_PATH).resolve()
+    cache_path = CATALOG_CACHE_DIR / f"{hashlib.sha256(str(path).encode()).hexdigest()}.json"
+    # 동시에 들어오는 첫 페이지·다음 페이지 요청이 원본을 중복 스캔하지 않게 한다.
+    with _catalog_lock:
+        for _ in range(3):
+            stamp = _catalog_stamp(path)
+            key = (path, stamp)
+            cached = _catalogs.get(key)
+            if cached is not None:
+                _catalogs.move_to_end(key)
+                return cached
+            rows = _read_catalog_cache(cache_path, stamp)
+            if rows is None:
+                with closing(connect(path)) as connection:
+                    try:
+                        rows = tuple(connection.execute(
+                            "SELECT problem_id, title, time_limit, memory_limit FROM problems ORDER BY problem_id"
+                        ).fetchall())
+                    except sqlite3.Error as error:
+                        raise BojUnavailable(f"수집본 목록을 읽지 못했습니다: {error}") from error
+                # 수집 중 갱신된 DB로 캐시를 만들지 않는다.
+                if _catalog_stamp(path) != stamp:
+                    continue
+                _write_catalog_cache(cache_path, stamp, rows)
+            elif _catalog_stamp(path) != stamp:
+                continue
+            catalog = _Catalog(rows, tuple((str(row[0]), (row[1] or "").casefold()) for row in rows))
+            _catalogs[key] = catalog
+            while len(_catalogs) > 4:
+                _catalogs.popitem(last=False)
+            return catalog
+    raise BojUnavailable("백준 수집본이 갱신 중입니다. 잠시 후 목록을 다시 불러오세요.")
 
 #: 섹션을 문제 필드로 보내는 규칙. 어디에도 걸리지 않는 섹션은 힌트로 간다.
 SECTION_STATEMENT: Final[str] = "description"
@@ -445,6 +555,7 @@ def load_boj_problem(
 
     problem = Problem(
         slug=f"{SLUG_PREFIX}{problem_id}",
+        boj_id=problem_id,
         title=str(title or f"{problem_id}번"),
         statement=fields["statement"],
         input_spec=fields["input_spec"],
@@ -469,6 +580,31 @@ def load_boj_problem(
 
 def source_url(problem_id: int) -> str:
     return SOURCE_URL.format(problem_id=problem_id)
+
+
+def initial_catalog_page(*, limit: int = 10, db_path: Path | None = None) -> dict:
+    """첫 화면은 11개만 읽는다. 전체 집계나 메타데이터 캐시 생성 완료를 기다리지 않는다."""
+    with closing(connect(db_path)) as connection:
+        try:
+            rows = connection.execute(
+                "SELECT problem_id, title, time_limit, memory_limit FROM problems"
+                " ORDER BY problem_id LIMIT ?", (limit + 1,),
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise BojUnavailable(f"수집본 목록을 읽지 못했습니다: {error}") from error
+    return {"total": None, "offset": 0, "limit": limit, "has_more": len(rows) > limit,
+            "items": [dict(zip(_CATALOG_FIELDS, row)) for row in rows[:limit]]}
+
+
+def list_problems(query: str = "", *, offset: int = 0, limit: int = 10,
+                  db_path: Path | None = None) -> dict:
+    """작은 메타데이터 캐시에서 검색·페이징한다. 지문 DB를 매번 전수 스캔하지 않는다."""
+    catalog = _get_catalog(db_path)
+    needle = query.casefold()
+    rows = tuple(row for row, (number, title) in zip(catalog.rows, catalog.search)
+                 if needle in number or needle in title) if needle else catalog.rows
+    return {"total": len(rows), "offset": offset, "limit": limit,
+            "items": [dict(zip(_CATALOG_FIELDS, row)) for row in rows[offset:offset + limit]]}
 
 
 def import_into_workspace(
@@ -692,3 +828,14 @@ def _numbered_images(folder: Path, root: Path) -> tuple[Path, ...]:
             continue
         matched.append((int(match.group(1)), path))
     return tuple(path for _, path in sorted(matched)[:MAX_FIGURES])
+
+
+def catalog_entries(problem_ids: list[int]) -> list[dict]:
+    """선택한 문제의 메타데이터만 선택 순서대로 돌려준다."""
+    wanted = set(problem_ids)
+    entries = {row[0]: dict(zip(_CATALOG_FIELDS, row))
+               for row in _get_catalog(None).rows if row[0] in wanted}
+    missing = wanted - entries.keys()
+    if missing:
+        raise BojNotFound(f"수집본에 없는 문제: {', '.join(map(str, sorted(missing)))}")
+    return [entries[number] for number in problem_ids]

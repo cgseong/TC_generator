@@ -11,7 +11,7 @@
 프롬프트는 argv가 아니라 stdin으로 넘긴다. Windows 명령줄 길이 제한(약 32K)에
 지문이 걸리는 것을 피하기 위함이다.
 
-**예외는 PDF 지문 하나뿐이다.** 그림은 텍스트로 옮겨 붙일 수 없으므로
+**예외는 PDF 지문과 첨부 그림이다.** 그림은 텍스트로 옮겨 붙일 수 없으므로
 :meth:`ClaudeCLI.ask_json_about_files`는 지정한 폴더에 한해 ``Read``를 연다.
 받는 것은 여전히 JSON 텍스트뿐이고, 쓰기·실행·네트워크 도구는 그대로 막힌다.
 """
@@ -27,7 +27,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, ClassVar, Mapping, Protocol, Sequence
 
 from tcgen.config import LLM_MAX_RETRIES, LLM_TIMEOUT_S
 
@@ -99,6 +99,24 @@ class LLMResponse:
 CommandRunner = Callable[[Sequence[str], str, float], subprocess.CompletedProcess]
 
 
+class LLMClient(Protocol):
+    def ask_code(self, prompt: str, *, tag: str = "code") -> str: ...
+    def ask_json(self, prompt: str, *, tag: str = "json") -> dict[str, Any]: ...
+    def ask_json_about_files(self, prompt: str, paths: Sequence[Path], *, tag: str = "file") -> dict[str, Any]: ...
+
+
+def make_cli(provider: str = "claude", *, model: str | None = None, log_dir: Path | None = None) -> LLMClient:
+    if provider == "claude":
+        return ClaudeCLI(model=model, log_dir=log_dir)
+    if provider == "anthropic":
+        from tcgen.anthropic_client import AnthropicSDKClient
+        return AnthropicSDKClient(model=model or "claude-opus-5-5", log_dir=log_dir)
+    if provider == "codex":
+        from tcgen.codex import CodexCLI
+        return CodexCLI(model=model, log_dir=log_dir)
+    raise ValueError(f"지원하지 않는 AI 제공자입니다: {provider}")
+
+
 def _run_subprocess(
     argv: Sequence[str], prompt: str, timeout_s: float
 ) -> subprocess.CompletedProcess:
@@ -117,6 +135,8 @@ def _run_subprocess(
 @dataclass(frozen=True)
 class ClaudeCLI:
     """Claude Code CLI 클라이언트."""
+
+    provider: ClassVar[str] = "claude"
 
     executable: str = "claude"
     model: str | None = None
@@ -143,8 +163,9 @@ class ClaudeCLI:
             raise LLMError(f"CLI를 실행할 수 없습니다: {error}") from error
 
         duration_ms = int((time.perf_counter() - started) * 1000)
-        text = _extract_result_text(completed)
+        # 실패 응답도 기록한 뒤 해석한다. 해석에서 먼저 예외가 나면 원인이 사라진다.
         self._write_log(tag, prompt, completed, duration_ms)
+        text = _extract_result_text(completed)
         return LLMResponse(text=text, duration_ms=duration_ms, tag=tag)
 
     def ask_code(self, prompt: str, *, tag: str = "code") -> str:
@@ -230,6 +251,7 @@ class ClaudeCLI:
         prompt: str,
         completed: subprocess.CompletedProcess,
         duration_ms: int,
+        *, error_detail: str | None = None,
     ) -> None:
         """호출 기록을 남긴다 (PRD F2-A4, NF-R1)."""
         if self.log_dir is None:
@@ -239,6 +261,7 @@ class ClaudeCLI:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             path = self.log_dir / f"{stamp}-{next(_LOG_SEQUENCE):04d}-{tag}.json"
             payload = {
+                "provider": self.provider,
                 "tag": tag,
                 "duration_ms": duration_ms,
                 "returncode": completed.returncode,
@@ -246,34 +269,84 @@ class ClaudeCLI:
                 "stdout": redact(completed.stdout)[:_LOG_STDOUT_LIMIT],
                 "stderr": redact(completed.stderr)[:_LOG_STDERR_LIMIT],
             }
+            response = _read_result_payload(completed.stdout)
+            if error_detail is not None:
+                payload["error"] = redact(error_detail)
+            elif completed.returncode != 0 or (response and response.get("is_error")):
+                # stdout의 앞부분이 통계로 가득 차 있어도 실제 오류는 별도로 보존한다.
+                payload["error"] = _failure_detail(completed, response)
             path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError as error:  # 로그 실패가 본 작업을 막아서는 안 된다
             logger.warning("LLM 호출 로그를 남기지 못했습니다: %s", error)
 
 
+def _read_result_payload(stdout: str | None) -> Mapping[str, Any] | None:
+    try:
+        payload = json.loads(stdout or "")
+    except (ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _failure_detail(
+    completed: subprocess.CompletedProcess, payload: Mapping[str, Any] | None
+) -> str:
+    """사용량·세션 메타데이터보다 실제 오류 본문을 먼저 보여 준다."""
+    payload = payload or {}
+    message = payload.get("result")
+    if not isinstance(message, str) or not message.strip():
+        error = payload.get("error")
+        if isinstance(error, Mapping):
+            message = error.get("message")
+        elif isinstance(error, str):
+            message = error
+    if not isinstance(message, str) or not message.strip():
+        errors = payload.get("errors")
+        if isinstance(errors, list):
+            parts = [item if isinstance(item, str) else str(item.get("message", ""))
+                     for item in errors if isinstance(item, (str, Mapping))]
+            message = " · ".join(part for part in parts if part)
+    if not isinstance(message, str) or not message.strip():
+        message = completed.stderr or completed.stdout or "오류 설명이 없습니다."
+    detail = redact(message.strip())[:1500]
+    status, code = payload.get("api_error_status"), payload.get("api_error_code")
+    context = [f"HTTP {status}" if status else "", str(code) if code else ""]
+    context = ", ".join(part for part in context if part)
+    if context:
+        detail = f"{detail} ({redact(context)[:300]})"
+    if code == "oauth_not_allowed_for_organization":
+        detail += (
+            "\n현재 로그인한 조직이 Claude 구독의 Claude Code 사용을 허용하지 않습니다. "
+            "조직 관리자에게 사용 허용을 요청하거나, 터미널에서 `claude auth login`으로 "
+            "접근 가능한 계정·조직에 다시 로그인해 주세요."
+        )
+    elif status == 401 or code == "authentication_error":
+        detail += "\n터미널에서 `claude auth login`으로 인증 상태를 갱신해 주세요."
+    return detail
+
+
 def _extract_result_text(completed: subprocess.CompletedProcess) -> str:
     """``--output-format json`` 응답에서 본문 텍스트를 꺼낸다."""
     stdout = (completed.stdout or "").strip()
+    payload = _read_result_payload(stdout)
     if completed.returncode != 0:
-        # 종료 코드가 0이 아니면 stdout에 뭔가 있어도 답변으로 쓰지 않는다.
-        # 오류 메시지가 코드로 둔갑해 파일에 기록되는 것을 막는다.
-        detail = (completed.stderr or stdout or "").strip()[:300]
-        raise LLMError(f"CLI가 실패했습니다(code={completed.returncode}): {detail}")
+        # 실패 본문은 코드·정상 답변으로 채택하지 않는다.
+        raise LLMError(f"CLI가 실패했습니다(code={completed.returncode}): {_failure_detail(completed, payload)}")
     if not stdout:
         raise LLMError("CLI가 빈 응답을 돌려주었습니다.")
+    if payload is None:
+        try:
+            json.loads(stdout)
+        except ValueError:
+            # JSON이 아닌 정상 응답은 이전 버전처럼 원문을 쓴다.
+            return stdout
+        raise LLMError("CLI 응답에서 result 텍스트를 찾지 못했습니다.")
 
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError:
-        # 형식이 바뀌었더라도 본문을 그대로 쓸 수 있으면 쓴다.
-        return stdout
-
-    if isinstance(payload, Mapping):
-        if payload.get("is_error"):
-            raise LLMError(f"CLI가 오류를 보고했습니다: {payload.get('result') or stdout[:200]}")
-        result = payload.get("result")
-        if isinstance(result, str):
-            return result
+    if payload.get("is_error"):
+        raise LLMError(f"CLI가 오류를 보고했습니다: {_failure_detail(completed, payload)}")
+    result = payload.get("result")
+    if isinstance(result, str):
+        return result
     raise LLMError("CLI 응답에서 result 텍스트를 찾지 못했습니다.")
 
 

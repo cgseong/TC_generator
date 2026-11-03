@@ -2,8 +2,8 @@
 
 브루트포스 대조를 통과하기 전까지 정답 코드는 '후보'다. 이 모듈이 그 판정을
 내린다. 같은 LLM이 쓴 두 코드가 같은 오해를 공유할 수 있으므로, 대조 통과는
-'지문 해석이 옳다'가 아니라 '두 구현이 일치한다'는 뜻임에 유의한다. 해석
-자체는 사람이 확인한다(F1-4).
+'지문 해석이 옳다'가 아니라 '검증한 입력에서 두 구현이 일치한다'는 뜻이다.
+그림 전사와 문제 정보는 사용자가 보완할 수 있다.
 """
 
 from __future__ import annotations
@@ -84,6 +84,7 @@ def check_examples(
     """지문 예제를 통과하는지 본다. 가장 싼 1차 관문이다 (PRD F1-6)."""
     failures: list[str] = []
     first_counterexample: Counterexample | None = None
+    comparison = compare.comparison_for(problem)
     for index, example in enumerate(problem.examples, start=1):
         result = executor.run_on_bytes(
             solution_path, example.input.encode("utf-8"), problem.limits
@@ -98,7 +99,7 @@ def check_examples(
                 reason=f"예제 {index} 실행 실패: {failure_note(result)}",
             )
             continue
-        if not compare.outputs_match(example.output.encode("utf-8"), result.stdout):
+        if not compare.outputs_match(example.output.encode("utf-8"), result.stdout, comparison=comparison):
             failures.append(f"예제 {index}: 기대 '{example.output.strip()}' / 실제 '{actual}'")
             first_counterexample = first_counterexample or Counterexample(
                 input_text=example.input,
@@ -123,6 +124,7 @@ def run_stress(
     limits: Limits,
     validator_path: Path | None = None,
     on_progress: ProgressHook | None = None,
+    comparison: compare.OutputComparison | None = None,
 ) -> StressOutcome:
     """작은 랜덤 입력으로 정답 후보와 브루트포스를 대조한다 (PRD F2-B4)."""
     if rounds < MIN_STRESS_ROUNDS:
@@ -156,7 +158,7 @@ def run_stress(
                     note=f"생성기가 제약을 위반한 입력을 만들었습니다(seed={seed}): {message}",
                 )
 
-        outcome = _compare_once(executor, solution_path, brute_path, data, limits, seed)
+        outcome = _compare_once(executor, solution_path, brute_path, data, limits, seed, comparison=comparison)
         if outcome is not None:
             return StressOutcome(passed=False, rounds_run=seed, counterexample=outcome)
 
@@ -170,6 +172,7 @@ def _compare_once(
     data: bytes,
     limits: Limits,
     seed: int,
+    *, comparison: compare.OutputComparison | None = None,
 ) -> Counterexample | None:
     solution_result = executor.run_on_bytes(solution_path, data, limits)
     brute_result = executor.run_on_bytes(brute_path, data, HELPER_LIMITS)
@@ -191,7 +194,7 @@ def _compare_once(
             seed=seed,
             reason=f"정답 후보 실행 실패: {failure_note(solution_result)}",
         )
-    if not compare.outputs_match(brute_result.stdout, solution_result.stdout):
+    if not compare.outputs_match(brute_result.stdout, solution_result.stdout, comparison=comparison):
         return Counterexample(
             input_text=input_text,
             solution_output=solution_result.stdout.decode("utf-8", errors="replace"),
