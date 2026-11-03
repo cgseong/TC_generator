@@ -3,6 +3,10 @@
 /* TC_generator 브라우저 UI. 빌드 단계가 없도록 의존성 없이 작성한다. */
 
 const state = {
+  view: "home",
+  batchLoaded: false,
+  followBatch: true,
+  streamSlug: null,
   slug: null,
   problem: null,
   cases: [],
@@ -35,6 +39,37 @@ const $ = (id) => document.getElementById(id);
 const CATALOG_PAGE_SIZE = 10;
 const catalogPages = new Map();
 const CATALOG_CACHE_MS = 30_000;
+
+/* --------------------------------------------------------------- 화면 이동 */
+
+function showView(view, navigate = true) {
+  state.view = view === "execution" ? "execution" : "home";
+  const execution = state.view === "execution";
+  $("home-view").hidden = execution;
+  $("execution-view").hidden = !execution;
+  for (const [id, active] of [["home-button", !execution], ["execution-button", execution]]) {
+    $(id).classList.toggle("active", active);
+    if (active) $(id).setAttribute("aria-current", "page");
+    else $(id).removeAttribute("aria-current");
+  }
+  if (navigate) {
+    if (location.hash !== `#${state.view}`) history.pushState(null, "", `#${state.view}`);
+    $(execution ? "execution-title" : "home-title").focus({preventScroll: true});
+    window.scrollTo({top: 0});
+  }
+}
+
+function renderExecutionEmpty() {
+  $("execution-empty").hidden = Boolean(state.batch?.items?.length) || !$("workbench").hidden;
+}
+
+function highlightPreview() {
+  document.querySelectorAll("[data-boj-id]").forEach((button) => {
+    const active = Number(button.dataset.bojId) === state.previewId;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+}
 
 /* ------------------------------------------------------------------ 통신 */
 
@@ -212,8 +247,10 @@ async function selectProblem(slug) {
   state.slug = slug;
   $("author-source").value = state.authorDrafts[slug] || "";
   $("case-preview").hidden = true;
-  $("no-selection").hidden = true;
+  state.followBatch = false;
   $("workbench").hidden = false;
+  renderExecutionEmpty();
+  showView("execution");
   connectStream(slug);
   await refresh();
   await loadProblems();
@@ -296,6 +333,7 @@ function renderCatalog(result) {
     button.onclick = guard(() => previewBoj(item.problem_id));
     li.append(checkbox, button, completionControl(item.problem_id, record)); list.appendChild(li);
   });
+  highlightPreview();
   renderSelection();
 }
 
@@ -337,7 +375,22 @@ function toggleSelected(item, selected) {
 
 function renderSelection() {
   $("selection-count").textContent = `${state.selected.size} / 30개 선택`;
-  $("batch-start").disabled = !state.selected.size || Boolean(state.batch?.running) || state.batchStarting || state.providerSaving;
+  const selected = $("selected-problems");
+  selected.replaceChildren();
+  state.selected.forEach((item) => {
+    const chip = document.createElement("button");
+    chip.className = "selection-chip";
+    chip.textContent = `${item.problem_id} · ${item.title} ×`;
+    chip.setAttribute("aria-label", `${item.problem_id} ${item.title} 선택 해제`);
+    chip.onclick = () => toggleSelected(item, false);
+    selected.appendChild(chip);
+  });
+  const previewSelected = state.selected.has(state.previewId);
+  $("preview-select").textContent = previewSelected ? "선택 목록에서 제외" : "선택 목록에 추가";
+  $("preview-select").setAttribute("aria-pressed", String(previewSelected));
+  $("preview-select").disabled = !state.previewId || (!previewSelected && state.selected.size >= 30);
+  $("batch-start").textContent = state.batch?.running ? "실행 상황 보기" : "선택한 문제 실행하기";
+  $("batch-start").disabled = (!state.selected.size && !state.batch?.running) || state.batchStarting || state.providerSaving;
   document.querySelectorAll("[data-select-id]").forEach((checkbox) => {
     checkbox.checked = state.selected.has(Number(checkbox.dataset.selectId));
   });
@@ -353,14 +406,21 @@ const batchLabels = {
 
 function renderBatch(batch) {
   state.batch = batch;
+  $("execution-indicator").hidden = !batch.running;
+  renderExecutionEmpty();
   $("batch-panel").hidden = !batch.items?.length;
   $("batch-cancel").hidden = !batch.running;
   $("batch-cancel").disabled = batch.status === "cancelling";
   const counts = batch.counts || {};
+  const finished = (batch.items || []).filter((item) => !["pending", "running"].includes(item.status)).length;
+  $("batch-progress").max = batch.items?.length || 1;
+  $("batch-progress").value = finished;
+  $("batch-progress").setAttribute("aria-valuetext", `${batch.items?.length || 0}개 중 ${finished}개 처리`);
   $("batch-summary").textContent = `${batchLabels[batch.status] || batch.status}${batch.llm?.provider ? ` · ${batch.llm.provider === "codex" ? "GPT" : "Claude"}` : ""} · 전체 ${batch.items?.length || 0}개 · 내보내기 ${counts.exported || 0} · 건너뜀 ${counts.skipped || 0} · 실패 ${counts.failed || 0} · 대기 ${counts.pending || 0}`;
   const list = $("batch-items"); list.innerHTML = "";
   (batch.items || []).forEach((item) => {
     const li = document.createElement("li");
+    li.dataset.status = item.status;
     const label = document.createElement("strong");
     label.textContent = `${item.problem_id} · ${item.title} — ${batchLabels[item.status] || item.status}`;
     label.className = item.status === "exported" || item.status === "skipped" ? "export-done" : "";
@@ -394,6 +454,12 @@ async function pollBatch() {
   try {
     const batch = await api("/api/batches/current");
     renderBatch(batch);
+    if (!state.batchLoaded) {
+      state.batchLoaded = true;
+      if (batch.running && !location.hash) showView("execution");
+    }
+    const active = (batch.items || []).find((item) => item.status === "running" && item.slug);
+    if (active && state.followBatch) connectStream(active.slug);
     const signature = JSON.stringify((batch.items || []).map((item) => [item.problem_id, item.status]));
     if (signature !== state.batchSignature) {
       state.batchSignature = signature;
@@ -418,6 +484,10 @@ function bindBatch() {
   };
   $("clear-selection").onclick = () => { state.selected.clear(); renderSelection(); };
   $("batch-start").onclick = guard(async () => {
+    if (state.batch?.running) {
+      showView("execution");
+      return;
+    }
     if (state.batchStarting || state.providerSaving || state.batch?.running || !state.selected.size) return;
     state.batchStarting = true;
     renderSelection();
@@ -426,6 +496,14 @@ function bindBatch() {
         problem_ids: [...state.selected.keys()], skip_exported: $("skip-exported").checked,
       }) });
       renderBatch(batch);
+      state.followBatch = true;
+      if (state.stream) state.stream.close();
+      state.stream = null;
+      state.streamSlug = null;
+      clearLog();
+      $("workbench").hidden = true;
+      renderExecutionEmpty();
+      showView("execution");
       $("batch-notice").textContent = "순차 실행을 시작했습니다. 페이지를 새로고침해도 서버에서 계속 실행합니다.";
       await pollBatch();
     } finally {
@@ -444,6 +522,7 @@ function bindBatch() {
     (state.batch.items || []).filter((item) => !["exported", "skipped"].includes(item.status))
       .forEach((item) => state.selected.set(item.problem_id, {problem_id: item.problem_id, title: item.title}));
     renderSelection();
+    showView("home");
   };
   renderSelection();
 }
@@ -453,8 +532,19 @@ async function previewBoj(number) {
   clearTimeout(state.previewTimer);
   state.previewKey = null;
   state.previewId = number;
-  const payload = await api(`/api/boj/${number}`);
+  $("preview-notice").textContent = `${number}번 문제를 불러오는 중…`;
+  $("catalog-preview").hidden = true;
+  highlightPreview();
+  let payload;
+  try {
+    payload = await api(`/api/boj/${number}`);
+  } catch (error) {
+    if (state.previewId === number) $("preview-notice").textContent = error.message;
+    throw error;
+  }
   if (state.previewId !== number) return;
+  $("preview-notice").textContent = "";
+  renderSelection();
   const problem = payload.problem;
   $("catalog-preview").hidden = false;
   $("preview-title").textContent = `${number} · ${problem.title}`;
@@ -473,6 +563,9 @@ async function previewBoj(number) {
     pre.textContent = text || "수집본에 없음 · 작업 시작 후 직접 입력하세요.";
     body.append(h, pre);
   });
+  if (state.view === "home" && window.matchMedia("(max-width: 850px)").matches) {
+    $("catalog-preview").closest(".preview-pane").scrollIntoView({block: "start"});
+  }
 }
 
 function renderPreviewImages(info) {
@@ -514,6 +607,12 @@ function closeCatalogPreview() {
   clearTimeout(state.previewTimer);
   state.previewId = null; state.previewKey = null;
   $("catalog-preview").hidden = true;
+  $("preview-notice").textContent = "";
+  highlightPreview();
+  renderSelection();
+  if (state.view === "home" && window.matchMedia("(max-width: 850px)").matches) {
+    $("catalog-list").closest(".catalog-panel").scrollIntoView({block: "start"});
+  }
 }
 
 async function uploadFigure(number, file) {
@@ -768,10 +867,13 @@ function setBadge(id, text, variant) {
 /* -------------------------------------------------------------------- SSE */
 
 function connectStream(slug) {
+  if (state.streamSlug === slug && state.stream) return;
+  state.streamSlug = slug;
   if (state.stream) state.stream.close();
   state.stream = new EventSource(`/api/problems/${encodeURIComponent(slug)}/events`);
   clearLog();
   state.stream.onmessage = (message) => {
+    if (state.streamSlug !== slug) return;
     const event = JSON.parse(message.data);
     appendLog(event);
     if (slug !== state.slug) return;
@@ -861,9 +963,12 @@ function guard(handler) {
   return async (clickEvent) => {
     if (clickEvent) clickEvent.preventDefault();
     try {
+      $("app-notice").hidden = true;
       await handler();
     } catch (error) {
       logLocal(error.message, "error");
+      $("app-notice").textContent = error.message;
+      $("app-notice").hidden = false;
     }
   };
 }
@@ -900,6 +1005,15 @@ async function saveProblem() {
 }
 
 function bindCatalog() {
+  $("home-button").onclick = $("back-to-home").onclick = () => showView("home");
+  $("execution-button").onclick = () => showView("execution");
+  window.addEventListener("popstate", () => showView(location.hash.slice(1), false));
+  showView(location.hash.slice(1), false);
+  $("preview-select").onclick = () => {
+    const item = state.catalogPage?.items.find((item) => item.problem_id === state.previewId)
+      || {problem_id: state.previewId, title: $("preview-title").textContent.replace(/^\d+ · /, "")};
+    if (state.previewId) toggleSelected(item, !state.selected.has(state.previewId));
+  };
   bindBatch();
   bindProviders();
   $("saved-work").ontoggle = guard(loadProblems);
