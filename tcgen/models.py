@@ -93,6 +93,8 @@ class Figure:
     role: str = FIGURE_ROLE_DECORATIVE
     description: str = ""
     page: int = 0
+    #: 원문이 지정한 표시 너비(px). 0이면 모른다.
+    width: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +102,7 @@ class Figure:
             "role": self.role,
             "description": self.description,
             "page": self.page,
+            "width": self.width,
         }
 
     @classmethod
@@ -111,6 +114,7 @@ class Figure:
             role=role if role in FIGURE_ROLES else FIGURE_ROLE_DECORATIVE,
             description=str(data.get("description", "")),
             page=int(data.get("page", 0) or 0),
+            width=int(data.get("width", 0) or 0),
         )
 
     @property

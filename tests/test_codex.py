@@ -156,7 +156,7 @@ def test_provider_and_separate_model_preferences_persist(client):
 def test_invalid_settings_do_not_partly_change_provider(client):
     assert client.post('/api/settings', json={"provider":"claude", "model":"sonnet"}).status_code == 200
     assert client.post('/api/settings', json={"provider":"codex", "drive_folder":"invalid"}).status_code == 400
-    assert server._llm_settings() == {"provider":"claude", "model":"sonnet"}
+    assert server._llm_settings() == {"provider":"claude", "model":"sonnet", "effort": None}
 
 
 def test_environment_reports_selected_cli_and_login_status(client, monkeypatch):
@@ -186,5 +186,5 @@ def test_batch_keeps_provider_selected_at_start(client, collection, monkeypatch)
     client.post('/api/settings', json={"provider":"claude", "model":"sonnet"})
     release.set()
     assert finished.wait(3)
-    assert seen == [{"provider":"codex", "model":"gpt-custom"}] * 2
+    assert seen == [{"provider":"codex", "model":"gpt-custom", "effort": None}] * 2
     assert server._batch_manager().snapshot()["llm"]["provider"] == "codex"

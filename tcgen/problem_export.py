@@ -5,13 +5,16 @@ HTML의 원래 참조 위치에서 zip 안의 상대 경로로 참조한다.
 """
 from __future__ import annotations
 
+import io
 import json
 import re
 import zipfile
 from html import escape
 from pathlib import Path, PurePosixPath
 
-from tcgen import compare, exporter, images
+from PIL import Image
+
+from tcgen import compare, exporter, images, statement_html
 from tcgen.config import DIFFICULTY_LEVELS
 from tcgen.workspace import Workspace
 
@@ -21,6 +24,9 @@ REQUIRED = {"display_id", "title", "description", "tags", "input_description", "
             "test_case_score", "hint", "time_limit", "memory_limit", "samples", "template", "spj",
             "rule_type", "source", "field", "difficulty", "answers"}
 _IMAGE = re.compile(r"\[그림\s*(\d+)\]")
+#: 원문 표시 너비를 모르는 그림(직접 첨부 등)의 최대 표시 너비(px).
+DEFAULT_FIGURE_WIDTH = 400
+_IMAGE_SRC = re.compile(r'<img\b[^>]*src=[\'\"](images/\d+\.png)[\'\"]', re.I)
 
 
 def destination(workspace: Workspace) -> Path:
@@ -41,6 +47,23 @@ def remove_archives(workspace: Workspace) -> None:
         path.unlink(missing_ok=True)
 
 
+def _display_width(original: int, data: bytes) -> int:
+    """원문 표시 너비를 쓴다. 모르면 원본 크기로 두되 지나치게 크지 않게 줄인다."""
+    if original > 0:
+        return original
+    with Image.open(io.BytesIO(data)) as image:
+        return min(image.width, DEFAULT_FIGURE_WIDTH)
+
+
+def section_texts(problem) -> dict[str, str]:
+    """내보낼 지문 섹션의 원문. 제한 조건은 입력 설명 뒤에 붙인다."""
+    input_text = problem.input_spec
+    if problem.constraints and problem.constraints not in input_text:
+        input_text += "\n\n" + problem.constraints
+    return {"description": problem.statement, "input_description": input_text,
+            "output_description": problem.output_spec}
+
+
 def build_payload(workspace: Workspace, metadata: dict) -> tuple[dict, dict[str, bytes]]:
     problem = workspace.load_problem()
     used = set()
@@ -56,16 +79,25 @@ def build_payload(workspace: Workspace, metadata: dict) -> tuple[dict, dict[str,
                 raise exporter.ExportError(f"[그림 {number}] 파일이 없습니다. 그림을 첨부하거나 Drive에서 가져와 주세요.")
             name = f"images/{number}.png"
             figures[name] = images.normalize(path.read_bytes())
-            embedded[number] = f'<img src="{name}" alt="그림 {number}" style="max-width:100%;height:auto" />'
+            width = _display_width(problem.figures[number - 1].width, figures[name])
+            embedded[number] = (f'<img src="{name}" alt="그림 {number}" width="{width}" '
+                                'style="max-width:100%;height:auto" />')
         used.add(number)
         return embedded[number]
 
-    def html(text: str) -> dict:
-        # 사용자 지문을 HTML로 실행하지 않는다. 그림 자리만 앱이 만든 img로 치환한다.
-        text = str(text or "")
+    def normalize_refs(text: str) -> str:
         for number, item in enumerate(problem.figures, 1):
             if item.ref and item.ref != f"[그림 {number}]":
                 text = text.replace(item.ref, f"[그림 {number}]")
+        return text
+
+    def html(text: str, formatted: str | None = None) -> dict:
+        if formatted:
+            # 서식 HTML은 허용 목록으로 정리하고 원문 보존을 확인한 것이다.
+            return {"format": "html", "value": _IMAGE.sub(lambda match: figure(int(match.group(1))),
+                                                          normalize_refs(formatted))}
+        # 사용자 지문을 HTML로 실행하지 않는다. 그림 자리만 앱이 만든 img로 치환한다.
+        text = normalize_refs(str(text or ""))
         if not text.strip():
             return {"format": "html", "value": ""}
         paragraphs = []
@@ -84,15 +116,21 @@ def build_payload(workspace: Workspace, metadata: dict) -> tuple[dict, dict[str,
             paragraphs.append("<p>" + content.replace("\n", "<br />") + "</p>")
         return {"format": "html", "value": "".join(paragraphs)}
 
-    description = html(problem.statement)
-    input_text = problem.input_spec
-    if problem.constraints and problem.constraints not in input_text:
-        input_text += "\n\n" + problem.constraints
-    input_description = html(input_text)
-    output_description, hint = html(problem.output_spec), html(problem.hints)
+    texts = section_texts(problem)
+    styled = metadata.get("statement_html") or {}
+    # 지문을 고친 뒤라면 예전 서식은 쓰지 않는다.
+    formatted = (styled.get("sections") or {}) if styled.get("source_key") == statement_html.source_key(texts) else {}
+    description = html(texts["description"], formatted.get("description"))
+    input_description = html(texts["input_description"], formatted.get("input_description"))
+    output_description = html(texts["output_description"], formatted.get("output_description"))
+    # 힌트는 원문에 있어도 내보내지 않는다. 형식상 필수인 필드는 빈 HTML로 둔다.
+    hint = {"format": "html", "value": ""}
+    hint_images = {int(match.group(1)) for match in _IMAGE.finditer(problem.hints)}
+    hint_images.update(number for number, item in enumerate(problem.figures, 1)
+                       if item.ref and item.ref in problem.hints)
     # 수동 첨부만 한 그림은 본문 아래에 두되 [그림 N]으로 원하는 위치를 지정할 수 있다.
     for number in range(1, len(problem.figures) + 1):
-        if number not in used:
+        if number not in used and number not in hint_images:
             description["value"] += f"<p>{figure(number)}</p>"
     numbers = exporter.collect_case_numbers(workspace.cases_dir)
     if {record.index for record in workspace.load_cases_index()} != set(numbers):
@@ -132,11 +170,11 @@ def _validate_payload(payload: dict) -> list[str]:
         errors.append("난이도는 VeryLow/Low/Mid/High/VeryHigh여야 합니다.")
     if not isinstance(payload["tags"], list) or not 1 <= len(payload["tags"]) <= 3 or any(not isinstance(tag, str) or not tag.strip() for tag in payload["tags"]):
         errors.append("태그는 1~3개의 문자열이어야 합니다.")
-    if not isinstance(payload["samples"], list) or not 1 <= len(payload["samples"]) <= 4 or any(
+    if not isinstance(payload["samples"], list) or not payload["samples"] or any(
         not isinstance(item, dict) or not isinstance(item.get("input"), str) or not isinstance(item.get("output"), str)
         or not item["input"] or not item["output"] for item in payload["samples"]
     ):
-        errors.append("code-place 예제 입출력은 빈 문자열이 아닌 1~4쌍이어야 합니다.")
+        errors.append("예제 입출력은 빈 문자열이 아닌 1쌍 이상이어야 합니다.")
     for name, maximum in (("time_limit", 60000), ("memory_limit", 1024)):
         if type(payload[name]) is not int or not 1 <= payload[name] <= maximum:
             errors.append(f"code-place의 {name} 허용 범위는 1~{maximum}입니다.")
@@ -229,7 +267,7 @@ def verify_problem_zip(path: Path) -> tuple[exporter.ExportIssue, ...]:
                             if b"\r\n" in data:
                                 errors.append(f"{name}에 CRLF가 남아 있습니다.")
                 html = "".join(payload[key]["value"] for key in ("description", "input_description", "output_description", "hint"))
-                for src in re.findall(r'<img\b[^>]*src=[\'\"](images/\d+\.png)[\'\"]', html, re.I):
+                for src in _IMAGE_SRC.findall(html):
                     name = root + "/" + src
                     expected.add(name)
                     if name not in files:
@@ -265,9 +303,19 @@ def bundle(paths: list[Path], target: Path) -> None:
                     for root in roots:
                         index += 1
                         prefix = root + "/"
+                        payload = json.loads(source.read(prefix + "problem.json"))
+                        hint_images = set(_IMAGE_SRC.findall(payload["hint"]["value"]))
+                        content_images = {name for key in ("description", "input_description", "output_description")
+                                          for name in _IMAGE_SRC.findall(payload[key]["value"])}
+                        hint_only_images = hint_images - content_images
+                        payload["hint"] = {"format": "html", "value": ""}
                         for name in source.namelist():
                             if name.startswith(prefix) and not name.endswith("/"):
-                                output.writestr(str(index) + "/" + name[len(prefix):], source.read(name))
+                                relative = name[len(prefix):]
+                                if relative == "problem.json":
+                                    output.writestr(f"{index}/problem.json", encode_problem_json(payload))
+                                elif relative not in hint_only_images:
+                                    output.writestr(str(index) + "/" + relative, source.read(name))
         issues = verify_problem_zip(staging)
         if issues:
             raise exporter.ExportError(issues[0].message)

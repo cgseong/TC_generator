@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from tcgen import compare, exporter, history, images, problem_export
+from tcgen import compare, exporter, history, images, problem_export, statement_html
 from tcgen.config import (
     DEFAULT_FIX_ATTEMPTS,
     DEFAULT_REINFORCE_ROUNDS,
@@ -778,11 +778,12 @@ class Pipeline:
         return result
 
     def prepare_export_metadata(self, *, final_checked: bool = False) -> dict:
-        """메타데이터와 예제를 생성·검증해 저장한다. 동일 문제의 분류는 재사용한다."""
+        """메타데이터와 원문 예제를 검증해 저장한다. 동일 문제의 분류는 재사용한다."""
         if not self.problem.solution_confirmed:
             raise PipelineError("정답 코드를 먼저 확정해 주세요.")
         if not self.workspace.load_cases_index():
-            raise PipelineError("예제 선정에 사용할 테스트케이스를 먼저 생성해 주세요.")
+            raise PipelineError("최종 검증에 사용할 테스트케이스를 먼저 생성해 주세요.")
+        samples = metadata.original_samples(self.problem)
         if not final_checked and not self.verify_final(invalidate_export=False)["passed"]:
             raise PipelineError("최종 검증에 실패해 문제 내보내기 정보를 생성할 수 없습니다.")
         self._check_cancel()
@@ -798,15 +799,33 @@ class Pipeline:
         classification = metadata.classify(self.problem, source, self.cli,
             cached=cached, on_progress=progress,
             cache_dir=self.workspace.root.parent / ".tcgen-classifications")
+        # 과거 메타데이터에 남은 힌트 검토 결과도 새 내보내기에는 사용하지 않는다.
+        classification = {key: value for key, value in classification.items() if key != "hint_review"}
         cache_path.write_text(json.dumps(classification, ensure_ascii=False, indent=2), encoding="utf-8")
-        samples = metadata.select_samples(self.workspace, self.executor, on_progress=progress)
-        result = {**classification, **samples, "source": problem_export.SOURCE}
+        result = {**classification, **samples, "source": problem_export.SOURCE,
+                  "statement_html": self._statement_html(cached)}
         # 그림 누락·필수 항목 오류도 실제 export 전에 확인한다.
         problem_export.build_payload(self.workspace, result)
         self._state["export_metadata"] = result
         self._persist_state()
         self.write_report()
         return result
+
+    def _statement_html(self, cached: dict | None) -> dict | None:
+        """지문에 코드 블록·표·수식 등 서식을 입힌다. 실패하면 평문으로 내보낸다."""
+        texts = problem_export.section_texts(self.problem)
+        previous = (cached or {}).get("statement_html")
+        if isinstance(previous, dict) and previous.get("source_key") == statement_html.source_key(texts):
+            return previous
+        self._progress(STAGE_EXPORT, "지문에 서식(코드 블록·표·수식)을 입히는 중입니다.")
+        try:
+            return statement_html.format_sections(
+                texts, self.cli, on_progress=lambda message: self._progress(STAGE_EXPORT, message))
+        except Cancelled:
+            raise
+        except Exception as error:  # 서식은 선택 사항이라 어떤 실패도 내보내기를 막지 않는다
+            self.bus.emit(STAGE_EXPORT, f"지문 서식 변환에 실패해 평문으로 내보냅니다: {error}", LEVEL_WARN)
+            return None
 
     def verify_final(self, *, invalidate_export: bool = True) -> dict[str, Any]:
         if not self.problem.solution_confirmed:

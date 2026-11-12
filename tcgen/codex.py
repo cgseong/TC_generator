@@ -17,7 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, Sequence
 
-from tcgen.llm import ClaudeCLI, CommandRunner, LLMError, LLMResponse, extract_json, redact
+from tcgen.llm import ClaudeCLI, CommandRunner, LLMError, LLMResponse, TokenUsage, _token_count, extract_json, redact
+from tcgen.pricing import gpt_cost
 
 # 앱이 실행·파일 기록을 담당하므로 모델에 실행·연결 도구를 제공하지 않는다.
 _DISABLED_FEATURES = (
@@ -99,6 +100,22 @@ def _extract_codex_text(completed: subprocess.CompletedProcess) -> str:
     return messages[-1]
 
 
+def _record_codex_usage(usage: TokenUsage, stdout: str | None, model: str | None) -> None:
+    # Codex는 turn.completed에 토큰만 알린다. 모델은 지정한 값으로, 비용은 공개 단가로 계산한다.
+    for line in (stdout or "").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
+            stats = event["usage"]
+            tokens = {"input": _token_count(stats.get("input_tokens")),
+                      "cached": _token_count(stats.get("cached_input_tokens")),
+                      "output": _token_count(stats.get("output_tokens"))}
+            usage.add(**tokens, cost_usd=gpt_cost(model, tokens["input"], tokens["cached"], tokens["output"]),
+                      models=[model] if model else [])
+
+
 def _prepare_images(paths: Sequence[Path], folder: Path) -> tuple[Path, ...]:
     from tcgen.images import normalize
     if not paths:
@@ -159,6 +176,8 @@ class CodexCLI(ClaudeCLI):
             argv.extend(["-c", setting])
         if self.model:
             argv.extend(["--model", self.model])
+        if self.effort:
+            argv.extend(["-c", f'model_reasoning_effort="{self.effort}"'])
         for path in images:
             argv.append(f"--image={path}")
         argv.append("-")
@@ -178,6 +197,7 @@ class CodexCLI(ClaudeCLI):
             except OSError as error:
                 raise LLMError(f"Codex CLI를 실행할 수 없습니다: {error}") from error
             duration = int((time.perf_counter() - started) * 1000)
+            _record_codex_usage(self.usage, completed.stdout, self.model)
             try:
                 text = _extract_codex_text(completed)
             except LLMError as error:

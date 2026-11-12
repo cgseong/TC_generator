@@ -11,57 +11,77 @@
 <body>
 <header class="topbar">
   <div class="brand">
-    <span class="brand-mark" aria-hidden="true">TC</span>
-    <div><h1>TC_generator</h1><p>문제 · 테스트케이스 생성</p></div>
+    <h1>TC_generator</h1>
   </div>
   <div class="provider-switch">
     <div class="provider-controls">
-      <label for="llm-provider">사용할 AI</label>
+      <label for="llm-provider">AI</label>
       <select id="llm-provider" aria-label="사용할 AI">
         <option value="claude">Claude Pro 구독</option>
-        <option value="anthropic">Claude API 직접 호출 (빠름)</option>
         <option value="codex">GPT (ChatGPT 구독)</option>
       </select>
       <button id="llm-check" class="secondary">로그인 확인</button>
+    </div>
+    <div class="model-controls">
+      <label for="model-input">모델</label>
+      <select id="model-input" aria-label="사용할 모델"></select>
+      <label for="effort-input">effort</label>
+      <select id="effort-input" aria-label="추론 강도(effort)"></select>
     </div>
     <span id="llm-status" class="hint" aria-live="polite"></span>
   </div>
   <details class="environment-details">
     <summary><span id="env-summary">실행 환경</span></summary>
-    <div id="env-badges" class="badges"></div>
+    <div class="environment-content">
+      <div id="env-badges" class="badges"></div>
+      <p id="isolation-banner" class="isolation-note" hidden></p>
+    </div>
   </details>
 </header>
 
-<div id="isolation-banner" class="banner banner-warn" hidden></div>
 
 <div id="app-notice" class="banner banner-warn" role="alert" hidden></div>
 
 <main class="app-main">
   <nav class="page-navigation" aria-label="주요 화면">
-    <button id="home-button" class="page-nav active" aria-current="page">01 <span>문제 선택</span></button>
+    <button id="home-button" class="page-nav active" aria-current="page"><span class="nav-step">1</span><span>백준 문제 선택</span></button>
     <span class="nav-divider" aria-hidden="true">/</span>
-    <button id="execution-button" class="page-nav">02 <span>실행 · 결과</span><span id="execution-indicator" class="activity-dot" hidden></span></button>
+    <button id="execution-button" class="page-nav"><span class="nav-step">2</span><span>실행 · 결과</span><span id="execution-indicator" class="activity-dot" hidden></span></button>
   </nav>
 
-  <section id="home-view" aria-labelledby="home-title">
-    <div class="page-heading">
-      <div><span class="eyebrow">PROBLEM LIBRARY</span><h2 id="home-title" tabindex="-1">문제를 고르고, 한 번에 실행하세요.</h2>
-      <p class="hint">목록에서 지문을 확인하고 실행할 문제를 선택하세요. 검색하거나 페이지를 넘겨도 선택은 유지됩니다.</p></div>
-    </div>
+  <section id="home-view" aria-labelledby="home-button" tabindex="-1">
     <div class="home-layout">
       <section class="panel catalog-panel">
-        <div class="section-heading"><h2>백준 문제 탐색</h2><span class="eyebrow">PROBLEMS</span></div>
+        <div class="section-heading sr-only"><h2>문제 목록</h2></div>
         <form id="catalog-search" class="inline-form">
           <input id="catalog-query" type="search" placeholder="번호 또는 제목 검색" aria-label="백준 문제 검색">
           <button type="submit" class="secondary">검색</button>
         </form>
-        <div id="catalog-status" class="hint" aria-live="polite">문제 목록을 불러오는 중입니다…</div>
+        <div class="batch-controls">
+          <div class="selection-heading">
+            <strong id="selection-count" aria-live="polite">0 / 30개 선택</strong>
+            <button id="batch-start" class="primary" disabled>선택한 문제 실행하기</button>
+          </div>
+          <details class="selection-details">
+            <summary>선택·실행 옵션</summary>
+            <div id="selected-problems" class="selected-problems" aria-label="선택한 문제"></div>
+            <label class="check-label"><input id="skip-exported" type="checkbox" checked> 이미 생성된 문제 건너뛰기 (업로드 완료 포함)</label>
+            <p id="batch-notice" class="hint" aria-live="polite">선택 순서대로 실행합니다. 한 번에 최대 30개를 선택할 수 있습니다.</p>
+          </details>
+        </div>
+        <div id="catalog-filter" class="catalog-filter" role="group" aria-label="업로드 상태로 거르기">
+          <button type="button" data-status="all" aria-pressed="true" title="수집본의 모든 문제">전체</button>
+          <button type="button" data-status="uploaded" aria-pressed="false" title="지금 zip을 문제 사이트에 올렸다고 기록된 문제">업로드 완료</button>
+          <button type="button" data-status="pending_upload" aria-pressed="false" title="zip이 있는데 아직 업로드하지 않은 문제와, 업로드 뒤 zip을 다시 만들어 재업로드가 필요한 문제">업로드 대기</button>
+          <button type="button" data-status="not_uploaded" aria-pressed="false" title="zip이 없어 아직 업로드할 수 없는 문제(미생성·생성 실패·재생성 필요)">미업로드</button>
+        </div>
+        <div class="catalog-columns" aria-hidden="true"><span>실행</span><span>번호 · 문제 제목</span><span>상태</span></div>
         <ul id="catalog-list" class="problem-list catalog-list" data-initial-page=""></ul>
         <div class="inline-form catalog-pagination">
           <button id="catalog-prev" class="secondary" disabled>이전</button>
+          <div id="catalog-status" class="hint" aria-live="polite">문제 목록을 불러오는 중입니다…</div>
           <button id="catalog-next" class="secondary" disabled>다음</button>
         </div>
-        <p class="hint catalog-help">왼쪽 체크는 일괄 실행 선택 · 오른쪽 ‘완료’는 직접 체크·해제할 수 있습니다.</p>
         <div class="inline-form catalog-selection-tools">
           <button id="select-page" class="secondary">이 페이지 선택</button>
           <button id="clear-selection" class="secondary">선택 해제</button>
@@ -72,48 +92,28 @@
         </details>
       </section>
       <section class="panel preview-pane" aria-label="문제 미리보기">
-        <div class="section-heading"><h2>문제 미리보기</h2><span class="eyebrow">PREVIEW</span></div>
         <p id="preview-notice" class="hint" role="status"></p>
         <section id="catalog-preview" class="preview-document" hidden aria-live="polite">
-          <div class="preview-actions">
-            <button id="preview-select" class="primary">선택 목록에 추가</button>
-            <button id="catalog-import" class="secondary">문제 수정·개별 작업</button>
-            <button id="catalog-close" class="secondary">닫기</button>
-          </div>
           <h2 id="preview-title"></h2>
           <div id="preview-limits" class="hint"></div>
+          <div class="preview-actions">
+            <button id="preview-select" class="primary">실행 목록에 추가</button>
+            <button id="catalog-import" class="secondary">내용 수정·개별 작업</button>
+            <button id="catalog-close" class="secondary" hidden>닫기</button>
+          </div>
           <p id="preview-image-status" class="hint" aria-live="polite"></p>
           <div id="preview-images" class="grid"></div>
           <div id="preview-body"></div>
         </section>
         <div id="no-selection" class="empty">
-          <div class="empty-icon" aria-hidden="true">&lt;/&gt;</div>
-          <h3>어떤 문제를 준비할까요?</h3>
-          <p>왼쪽 목록에서 문제를 누르면 지문을 미리 볼 수 있어요.<br>실행할 문제를 체크한 뒤 한 번에 시작하세요.</p>
-          <ol class="empty-flow" aria-label="작업 순서">
-            <li><span>1</span>문제 선택</li>
-            <li><span>2</span>정답·케이스 생성</li>
-            <li><span>3</span>검증·내보내기</li>
-          </ol>
+          <p>목록에서 문제를 선택하세요.</p>
         </div>
 
       </section>
     </div>
-    <div class="batch-controls home-runbar">
-      <div class="selection-heading"><strong id="selection-count" aria-live="polite">0 / 30개 선택</strong><span class="hint">최대 30개 · 선택 순서대로 실행</span></div>
-      <div id="selected-problems" class="selected-problems" aria-label="선택한 문제"></div>
-      <label class="check-label"><input id="skip-exported" type="checkbox" checked> 완료 표시된 문제 건너뛰기</label>
-      <button id="batch-start" class="primary" disabled>선택한 문제 실행하기</button>
-      <p id="batch-notice" class="hint" aria-live="polite">선택 순서대로 정답 확정부터 zip 내보내기까지 실행합니다.</p>
-    </div>
   </section>
 
-  <section id="execution-view" aria-labelledby="execution-title" hidden>
-    <div class="page-heading">
-      <div><span class="eyebrow">EXECUTION</span><h2 id="execution-title" tabindex="-1">실행 · 결과</h2>
-      <p class="hint">문제별 진행 상황을 확인하고 검증된 결과를 내려받으세요.</p></div>
-      <button id="back-to-home" class="secondary">← 문제 선택으로</button>
-    </div>
+  <section id="execution-view" aria-labelledby="execution-button" tabindex="-1" hidden>
     <div class="execution-layout">
       <section class="content" aria-label="문제 작업 공간">
         <section id="batch-panel" class="panel" hidden>
@@ -125,7 +125,13 @@
           <button id="batch-retry" class="secondary" hidden>미완료 문제 다시 선택</button>
         </section>
 
-        <div id="execution-empty" class="empty"><h3>아직 시작한 작업이 없어요.</h3><p>문제 선택 화면에서 실행할 문제를 골라 주세요.</p></div>
+        <section id="upload-log" class="panel" hidden>
+          <div class="section-heading"><h2>내려받기 · 업로드 기록</h2></div>
+          <p class="hint">zip을 내려받을 때마다 남습니다. 문제 사이트에 업로드한 뒤 "업로드 완료 기록"에서 실제로 업로드한 문제만 체크하세요.</p>
+          <ol id="upload-log-items" class="upload-log-items"></ol>
+        </section>
+
+        <div id="execution-empty" class="empty"><p>실행 내역이 없습니다.</p></div>
         <div id="workbench" hidden>
           <div class="tabs">
             <button class="tab active" data-tab="wizard">위저드</button>
@@ -169,7 +175,7 @@
                   <label>입력 설명<textarea id="f-input-spec" rows="3"></textarea></label>
                   <label>출력 설명<textarea id="f-output-spec" rows="3"></textarea></label>
                 </div>
-                <label>힌트<textarea id="f-hints" rows="3"></textarea></label>
+                <label>힌트(원문 · 내보내기 제외)<textarea id="f-hints" rows="3"></textarea></label>
 
                 <h3>그림 <span id="badge-figures" class="badge"></span></h3>
                 <p class="hint">
@@ -242,7 +248,7 @@
             <details class="step">
               <summary><span class="step-no">6</span> 내보내기 <span id="badge-export" class="badge"></span></summary>
               <div class="step-body">
-                <p class="hint">문제 가져오기용 zip: <code>1/problem.json</code>과 <code>1/testcase/N.in·N.out</code>. 출처는 Baekjoon Online Judge로 고정하고 AI가 난이도·영역·태그를 정합니다. 예제는 검증된 작은 입력에서 2~4개를 우선합니다.</p>
+                <p class="hint">문제 가져오기용 zip: <code>1/problem.json</code>과 <code>1/testcase/N.in·N.out</code>. 출처는 Baekjoon Online Judge로 고정하고 AI가 난이도·영역·태그를 정합니다. 공개 예제는 원문 입출력을 그대로 사용하며, 힌트는 내보내지 않습니다.</p>
                 <p class="hint">본문의 <code>[그림 1]</code> 같은 표시를 원하는 위치에 놓으세요. 그림을 그 자리에 내장하며, 표시가 없는 첨부 그림은 본문 아래에 넣습니다.</p>
                 <button id="export-metadata-button" class="secondary">내보내기 정보 생성·확인</button>
                 <div id="export-metadata-result" class="readout"></div>
@@ -262,9 +268,6 @@
             </section>
             <section class="panel">
               <h3>설정</h3>
-              <label>선택한 AI의 모델(비우면 기본값)
-                <input id="model-input" type="text" placeholder="비우면 선택한 AI의 기본 모델">
-              </label>
               <label>이미지 공유 폴더(Drive)
                 <input id="drive-folder" type="text" placeholder="https://drive.google.com/drive/folders/…">
               </label>
@@ -299,6 +302,20 @@
   </section>
 </main>
 
+<dialog id="upload-dialog" aria-labelledby="upload-dialog-title">
+  <h2 id="upload-dialog-title">업로드 완료로 기록할까요?</h2>
+  <p id="upload-dialog-when" class="hint"></p>
+  <p class="upload-dialog-guide">내려받은 zip을 문제 사이트에 <strong>업로드한 뒤</strong>, 실제로 업로드된 문제만 체크하고 기록하세요.
+    아직 업로드하지 않았다면 "나중에"를 누르세요. 실행 화면의 "내려받기 · 업로드 기록"에서 언제든 기록할 수 있습니다.</p>
+  <button id="upload-toggle-all" type="button" class="secondary">모두 해제</button>
+  <ul id="upload-dialog-items" class="upload-items"></ul>
+  <p id="upload-dialog-error" class="upload-dialog-error" role="alert"></p>
+  <div class="dialog-actions">
+    <button id="upload-later" type="button" class="secondary">나중에</button>
+    <button id="upload-confirm" type="button" class="primary">업로드 완료로 기록</button>
+  </div>
+</dialog>
+<div id="status-menu" class="status-menu" role="menu" aria-label="상태 변경" hidden></div>
 <script src="app.js"></script>
 </body>
 </html>

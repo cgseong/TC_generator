@@ -1,4 +1,4 @@
-"""문제 분류의 고정 평가 기준과 검증된 사용자용 예제 선정."""
+"""문제 분류의 고정 평가 기준과 원문 예제 내보내기."""
 from __future__ import annotations
 
 import ast
@@ -8,13 +8,8 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-from tcgen import compare
 from tcgen.config import DIFFICULTY_BANDS
-from tcgen.engine.generate import _reference_limits
 from tcgen.engine.prompts import _problem_block
-from tcgen.engine.solution import HELPER_LIMITS, validate_input
-from tcgen.models import Limits
-from tcgen.runner.base import Verdict
 
 RUBRIC_VERSION = "tcgen-difficulty-v2"
 FIELDS = {0: "구현", 1: "수학", 2: "자료구조", 3: "탐색", 4: "정렬", 5: "알고리즘"}
@@ -64,8 +59,6 @@ RUBRIC = f"""
 지문 길이·테스트 수·코드 길이나 오답 kill rate로 난이도를 높이지 않는다.
 기준은 내부 공통 척도이며 백준/solved.ac 등급을 추정해 치환하지 않는다.
 """.strip()
-MAX_SAMPLE_BYTES = 4096
-MAX_SAMPLE_LINES = 60
 _cache_guard = threading.Lock()
 _cache_locks: dict[str, threading.Lock] = {}
 
@@ -201,69 +194,20 @@ def classify(problem, source: str, cli, cached: dict | None = None,
         return result
 
 
-def _small(data: bytes) -> bool:
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        return False
-    return len(data) <= MAX_SAMPLE_BYTES and len(text.splitlines()) <= MAX_SAMPLE_LINES and all(len(line) <= 200 for line in text.splitlines())
+def original_samples(problem) -> dict:
+    """DB에서 가져왔거나 사용자가 입력한 원문 예제를 순서대로 내보낸다.
 
-
-def select_samples(workspace, executor, *, on_progress: Callable | None = None) -> dict:
-    """최종 검증된 케이스 중 작은 예제를 우선한다. 부족할 때만 작은 생성기를 사용한다."""
-    candidates = []
-    comparison = compare.comparison_for(workspace.load_problem())
-    seen = set()
-    priority = {"example": 0, "edge": 1, "random": 2, "anti": 3, "scale": 4}
-    for record in workspace.load_cases_index():
-        # 큰 입력은 메모리에 읽기 전 크기로 거른다.
-        paths = (workspace.input_path(record.index), workspace.output_path(record.index))
-        if any(not path.is_file() or path.stat().st_size > MAX_SAMPLE_BYTES for path in paths):
-            continue
-        data, output = (path.read_bytes() for path in paths)
-        if not _small(data) or not _small(output) or data in seen:
-            continue
-        seen.add(data)
-        candidates.append({"input": data.decode(), "output": output.decode(), "case_index": record.index,
-                           "label": record.label, "origin": f"case#{record.index}", "validated": True})
-    # 원문 예제를 우선하면서 유형·출력이 다른 사례를 섞는다.
-    candidates.sort(key=lambda item: (priority.get(item["label"], 9), len(item["input"]), item["case_index"]))
-    selected = []
-    while candidates and len(selected) < 3:
-        item = min(candidates, key=lambda item: (
-            any(prev["label"] == item["label"] for prev in selected),
-            any(prev["output"].rstrip() == item["output"].rstrip() for prev in selected),
-            priority.get(item["label"], 9), len(item["input"]), item["case_index"]))
-        selected.append(item)
-        candidates.remove(item)
-    generator = workspace.gens_dir / "stress_gen.py"
-    if len(selected) < 2 and generator.is_file():
-        for seed in range(1, 9):
-            if on_progress:
-                on_progress(f"사용자용 작은 예제를 검증하는 중입니다 (seed={seed}).")
-            generated = executor.run_script(generator, None, HELPER_LIMITS, args=(str(seed),), output_limit=MAX_SAMPLE_BYTES + 1)
-            data = generated.stdout.replace(compare.CRLF, compare.LF)
-            if generated.verdict is not Verdict.OK or data in seen or not _small(data):
-                continue
-            seen.add(data)
-            valid, _ = validate_input(executor, workspace.validator_path, data)
-            if not valid:
-                continue
-            reference = executor.run_on_bytes(workspace.solution_path, data, _reference_limits(workspace.load_problem().limits), output_limit=MAX_SAMPLE_BYTES + 1)
-            if reference.verdict is not Verdict.OK or not _small(reference.stdout):
-                continue
-            brute = executor.run_on_bytes(workspace.brute_path, data, Limits(time_ms=500, memory_mb=512), output_limit=MAX_SAMPLE_BYTES + 1)
-            if brute.verdict is Verdict.OK and not compare.outputs_match(reference.stdout, brute.stdout, comparison=comparison):
-                raise MetadataError("추가 예제에서 정답과 브루트포스가 불일치합니다.")
-            if brute.verdict not in {Verdict.OK, Verdict.TLE, Verdict.MLE}:
-                raise MetadataError("추가 예제의 브루트포스 실행이 실패했습니다.")
-            selected.append({"input": data.decode(), "output": compare.canonical_output(reference.stdout).decode(),
-                             "origin": f"stress_gen(seed={seed})", "validated": True,
-                             "brute_matched": brute.verdict is Verdict.OK})
-            if len(selected) >= 2:
-                break
-    if not selected:
-        raise MetadataError("사용자가 실행하기 적당한 예제를 확보하지 못했습니다. 작은 입력 생성기 또는 경계 케이스를 보완해 주세요.")
-    return {"samples": [{"input": item["input"], "output": item["output"]} for item in selected],
-            "sample_sources": [{key: value for key, value in item.items() if key not in {"input", "output", "label"}} for item in selected],
-            "sample_note": "서로 다른 작은 예제를 1개만 확보했습니다." if len(selected) == 1 else "최종 검증된 작은 케이스를 유형·출력 다양성을 고려해 선정했습니다."}
+    입력·출력을 재생성하거나 채점용 케이스에서 대체하지 않는다.
+    긴 예제와 모든 원문 예제를 유지하며, 줄바꿈만 LF로 맞춘다.
+    """
+    if not problem.examples:
+        raise MetadataError("원문 예제가 없습니다. 문제 입력에서 예제 입출력을 확인해 주세요. 예제를 자동으로 생성하지 않습니다.")
+    samples, sources = [], []
+    for index, example in enumerate(problem.examples, 1):
+        if not example.input or not example.output:
+            raise MetadataError(f"원문 예제 {index}의 입력 또는 출력이 비어 있습니다. 원문을 확인해 주세요.")
+        samples.append({key: value.replace("\r\n", "\n").replace("\r", "\n")
+                        for key, value in example.to_dict().items()})
+        sources.append({"origin": f"problem.examples#{index}", "example_index": index, "purpose": "original"})
+    return {"samples": samples, "sample_sources": sources,
+            "sample_note": f"원문 예제 {len(samples)}개를 입력·출력·순서대로 사용합니다."}

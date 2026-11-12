@@ -46,8 +46,8 @@ from tcgen.workspace import Workspace, create_workspace
 SLUG_PREFIX: Final[str] = "boj-"
 SOURCE_URL: Final[str] = "https://www.acmicpc.net/problem/{problem_id}"
 CATALOG_CACHE_DIR = PROJECT_ROOT / ".tcgen-cache" / "catalog"
-_CATALOG_VERSION = 1
-_CATALOG_FIELDS = ("problem_id", "title", "time_limit", "memory_limit")
+_CATALOG_VERSION = 2
+_CATALOG_FIELDS = ("problem_id", "title", "time_limit", "memory_limit", "special_judge")
 _catalog_lock = threading.Lock()
 _catalogs: OrderedDict = OrderedDict()
 
@@ -74,6 +74,17 @@ def _catalog_stamp(path: Path) -> tuple[int, ...]:
     return (main.st_dev, main.st_ino, main.st_size, main.st_mtime_ns, *wal_stamp)
 
 
+def _catalog_query(connection: sqlite3.Connection, suffix: str = "") -> str:
+    """목록 질의. 스페셜 저지 여부는 백준 문제 페이지의 라벨로 판정한다(정답이 여러 개일 수 있는 문제)."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(problems)")}
+    special = ("COALESCE(instr(raw_html, 'problem-label-spj') > 0, 0)" if "raw_html" in columns else "0")
+    return f"SELECT problem_id, title, time_limit, memory_limit, {special} FROM problems ORDER BY problem_id{suffix}"
+
+
+def _catalog_row(row) -> tuple:
+    return (*row[:4], bool(row[4]))
+
+
 def _read_catalog_cache(cache_path: Path, stamp: tuple[int, ...]) -> tuple | None:
     try:
         if cache_path.stat().st_size > 16 * 1024 * 1024:
@@ -83,8 +94,8 @@ def _read_catalog_cache(cache_path: Path, stamp: tuple[int, ...]) -> tuple | Non
             return None
         rows = data["rows"]
         if not isinstance(rows, list) or not all(
-            isinstance(row, list) and len(row) == 4 and type(row[0]) is int
-            and all(value is None or isinstance(value, str) for value in row[1:])
+            isinstance(row, list) and len(row) == len(_CATALOG_FIELDS) and type(row[0]) is int
+            and all(value is None or isinstance(value, str) for value in row[1:4]) and type(row[4]) is bool
             for row in rows
         ):
             return None
@@ -132,9 +143,7 @@ def _get_catalog(db_path: Path | None) -> _Catalog:
             if rows is None:
                 with closing(connect(path)) as connection:
                     try:
-                        rows = tuple(connection.execute(
-                            "SELECT problem_id, title, time_limit, memory_limit FROM problems ORDER BY problem_id"
-                        ).fetchall())
+                        rows = tuple(_catalog_row(row) for row in connection.execute(_catalog_query(connection)))
                     except sqlite3.Error as error:
                         raise BojUnavailable(f"수집본 목록을 읽지 못했습니다: {error}") from error
                 # 수집 중 갱신된 DB로 캐시를 만들지 않는다.
@@ -242,10 +251,22 @@ class FigureCounter:
     """
 
     sources: list[str] = field(default_factory=list)
+    widths: list[int] = field(default_factory=list)
 
-    def add(self, source: str) -> str:
+    def add(self, source: str, width: int = 0) -> str:
         self.sources.append(source)
+        self.widths.append(width)
         return figure_ref(len(self.sources))
+
+
+def _display_width(attrs: dict[str, str | None]) -> int:
+    """원문이 지정한 그림 표시 너비. 원본 파일은 이보다 훨씬 큰 경우가 많다."""
+    match = re.search(r"(?:^|;)\s*width\s*:\s*(\d+(?:\.\d+)?)px", attrs.get("style") or "", re.I)
+    value = match.group(1) if match else (attrs.get("width") or "").strip().removesuffix("px")
+    try:
+        return max(0, int(float(value)))
+    except ValueError:
+        return 0
 
 
 def figure_ref(number: int) -> str:
@@ -403,7 +424,7 @@ class _TextExtractor(HTMLParser):
         if self._figures is None:
             return ""
         source = attrs.get("src") or ""
-        return f" {self._figures.add(source)} "
+        return f" {self._figures.add(source, _display_width(attrs))} "
 
     @property
     def text(self) -> str:
@@ -566,7 +587,7 @@ def load_boj_problem(
         figures=tuple(
             # 전사 없는 그림을 decorative로 두면 그 그림이 정한 규칙이 조용히
             # 사라진다. 꼭 필요한 것으로 보고 시작해, 사람이 보고 내린다.
-            Figure(ref=figure_ref(number), role=FIGURE_ROLE_SPEC)
+            Figure(ref=figure_ref(number), role=FIGURE_ROLE_SPEC, width=counter.widths[number - 1])
             for number in range(1, len(counter.sources) + 1)
         ),
         limits=limits,
@@ -586,10 +607,8 @@ def initial_catalog_page(*, limit: int = 10, db_path: Path | None = None) -> dic
     """첫 화면은 11개만 읽는다. 전체 집계나 메타데이터 캐시 생성 완료를 기다리지 않는다."""
     with closing(connect(db_path)) as connection:
         try:
-            rows = connection.execute(
-                "SELECT problem_id, title, time_limit, memory_limit FROM problems"
-                " ORDER BY problem_id LIMIT ?", (limit + 1,),
-            ).fetchall()
+            rows = [_catalog_row(row) for row in
+                    connection.execute(_catalog_query(connection, " LIMIT ?"), (limit + 1,))]
         except sqlite3.Error as error:
             raise BojUnavailable(f"수집본 목록을 읽지 못했습니다: {error}") from error
     return {"total": None, "offset": 0, "limit": limit, "has_more": len(rows) > limit,
@@ -597,12 +616,20 @@ def initial_catalog_page(*, limit: int = 10, db_path: Path | None = None) -> dic
 
 
 def list_problems(query: str = "", *, offset: int = 0, limit: int = 10,
-                  db_path: Path | None = None) -> dict:
-    """작은 메타데이터 캐시에서 검색·페이징한다. 지문 DB를 매번 전수 스캔하지 않는다."""
+                  db_path: Path | None = None, include: set[int] | None = None,
+                  exclude: set[int] | None = None) -> dict:
+    """작은 메타데이터 캐시에서 검색·페이징한다. 지문 DB를 매번 전수 스캔하지 않는다.
+
+    ``include``·``exclude``는 문제 번호 집합으로 거른다(업로드 상태 필터).
+    """
     catalog = _get_catalog(db_path)
     needle = query.casefold()
     rows = tuple(row for row, (number, title) in zip(catalog.rows, catalog.search)
                  if needle in number or needle in title) if needle else catalog.rows
+    if include is not None:
+        rows = tuple(row for row in rows if row[0] in include)
+    if exclude:
+        rows = tuple(row for row in rows if row[0] not in exclude)
     return {"total": len(rows), "offset": offset, "limit": limit,
             "items": [dict(zip(_CATALOG_FIELDS, row)) for row in rows[offset:offset + limit]]}
 

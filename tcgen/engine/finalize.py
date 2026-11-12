@@ -14,6 +14,16 @@ from tcgen.runner.base import Verdict
 from tcgen.workspace import Workspace
 
 
+#: 큰 입력에서 완전탐색이 재귀 깊이·메모리 한도에 걸린 경우. 시간 초과와 같은 자원 초과다.
+_RESOURCE_ERRORS = ("RecursionError", "MemoryError", "StackOverflowError", "OutOfMemoryError")
+
+
+def _out_of_resources(result) -> bool:
+    if result.verdict in (Verdict.TLE, Verdict.MLE):
+        return True
+    return result.verdict is Verdict.RE and any(name in (result.stderr or "") for name in _RESOURCE_ERRORS)
+
+
 def verify_cases(
     executor: Executor,
     workspace: Workspace,
@@ -64,7 +74,7 @@ def verify_cases(
             Limits(time_ms=min(500, remaining_ms), memory_mb=512),
         )
         brute_seconds += time.monotonic() - started
-        if result.verdict in (Verdict.TLE, Verdict.MLE):
+        if _out_of_resources(result):
             item.update(status="skipped", note=f"브루트포스 자원 초과: {failure_note(result)}")
         elif result.verdict is not Verdict.OK:
             item["note"] = f"브루트포스 실행 실패: {failure_note(result)}"

@@ -280,6 +280,7 @@ def default_responses(**overrides: Any) -> dict[str, Any]:
         "mutants": mutants_payload(),
         "anti": anti_payload(),
         "fix": SOLUTION,
+        "statement-html": {},
         "export-metadata": {
             "field": 1, "field_reason": "두 정수의 덧셈", "tags": ["수학"], "algorithm": "O(1) 덧셈",
             "assessment": {name: {"score": 0, "reason": "사칙연산만 필요"}

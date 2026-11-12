@@ -34,8 +34,9 @@ def cases(workspace, count=1):
 
 
 class FinalExecutor:
-    def __init__(self, verdict=Verdict.OK, output=b"3\n"):
+    def __init__(self, verdict=Verdict.OK, output=b"3\n", stderr=""):
         self.verdict, self.output, self.calls = verdict, output, []
+        self.stderr = stderr
         self.reference_calls = []
         self.validator_verdict = Verdict.OK
         self.reference_verdict = Verdict.OK
@@ -49,7 +50,21 @@ class FinalExecutor:
             output = f"{sum(map(int, stdin.read_text().split()))}\n".encode()
             return RunResult(verdict=self.reference_verdict, stdout=output)
         self.calls.append((script, limits))
-        return RunResult(verdict=self.verdict, stdout=self.output)
+        return RunResult(verdict=self.verdict, stdout=self.output, stderr=self.stderr)
+
+
+@pytest.mark.parametrize("stderr,status", [
+    ("RecursionError: maximum recursion depth exceeded in comparison", "skipped"),
+    ("MemoryError", "skipped"),
+    ('Exception in thread "main" java.lang.StackOverflowError', "skipped"),
+    ("IndexError: list index out of range", "failed"),
+])
+def test_brute_runtime_errors_from_resource_limits_are_unverified(tmp_path, stderr, status):
+    workspace = create_workspace(make_problem(), base_dir=tmp_path)
+    cases(workspace)
+    result = verify_cases(FinalExecutor(Verdict.RE, b"", stderr), workspace)
+    assert result["results"][0]["status"] == status
+    assert result["passed"] == (status != "failed")
 
 
 @pytest.mark.parametrize("verdict,output,status", [

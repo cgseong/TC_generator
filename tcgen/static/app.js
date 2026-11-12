@@ -54,7 +54,7 @@ function showView(view, navigate = true) {
   }
   if (navigate) {
     if (location.hash !== `#${state.view}`) history.pushState(null, "", `#${state.view}`);
-    $(execution ? "execution-title" : "home-title").focus({preventScroll: true});
+    $(execution ? "execution-view" : "home-view").focus({preventScroll: true});
     window.scrollTo({top: 0});
   }
 }
@@ -128,7 +128,8 @@ async function loadEnvironment() {
   const banner = $("isolation-banner");
   banner.hidden = env.isolated;
   banner.textContent = `${env.banner} · 측정 방식 ${env.measurement}`;
-  $("model-input").value = env.model || "";
+  state.modelOptions = env.model_options || {};
+  renderLlmConfig(env.model, env.effort);
   $("drive-folder").value = env.drive_folder || "";
   $("drive-status").textContent = env.drive_credentials_available
     ? "서버 인증 설정됨 · 공개/접근 가능한 공유 폴더 사용 가능"
@@ -140,6 +141,56 @@ async function loadEnvironment() {
   refreshProviderStatus().catch((error) => { $("llm-status").textContent = error.message; });
 }
 
+function fillSelect(select, options, value) {
+  select.innerHTML = "";
+  options.forEach(([optionValue, label]) => {
+    const option = document.createElement("option");
+    option.value = optionValue; option.textContent = label;
+    select.appendChild(option);
+  });
+  select.value = value || "";
+}
+
+function renderLlmConfig(model, effort) {
+  const options = state.modelOptions?.[state.provider] || [];
+  const choices = [["", state.provider === "codex" ? "기본값 (API 환산 비용 계산 불가)" : "기본값"],
+    ...options.map((item) => [item.id, item.priced ? item.label : `${item.label} (단가 미상)`])];
+  if (model && !options.some((item) => item.id === model)) choices.push([model, model]);
+  fillSelect($("model-input"), choices, model);
+  const chosen = options.find((item) => item.id === model);
+  const levels = chosen ? chosen.efforts : [...new Set(options.flatMap((item) => item.efforts))];
+  const fallback = chosen?.default_effort ? `기본값 (${chosen.default_effort})` : "기본값";
+  fillSelect($("effort-input"), [["", fallback], ...levels.map((level) => [level, level])], effort);
+}
+
+function elapsedSeconds(start, end) {
+  const from = Date.parse(start || "");
+  const to = end ? Date.parse(end) : Date.now();
+  return Number.isFinite(from) && Number.isFinite(to) ? Math.max(0, (to - from) / 1000) : null;
+}
+
+function formatDuration(seconds) {
+  if (seconds == null) return "";
+  const total = Math.round(seconds);
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), sec = total % 60;
+  return h ? `${h}시간 ${m}분 ${sec}초` : m ? `${m}분 ${sec}초` : `${sec}초`;
+}
+
+function formatUsd(value) {
+  return `$${(value || 0).toFixed(value >= 1 ? 2 : 4)}`;
+}
+
+function formatUsage(usage) {
+  if (!usage?.calls) return "";
+  const n = (value) => (value || 0).toLocaleString("ko-KR");
+  const cost = usage.unpriced_calls
+    ? (usage.unpriced_calls === usage.calls ? "API 환산 비용 계산 불가(모델 지정 필요)"
+      : `API 환산 ${formatUsd(usage.cost_usd)} 이상 (${usage.unpriced_calls}회 단가 미상)`)
+    : `API 환산 ${formatUsd(usage.cost_usd)}`;
+  const models = usage.models?.length ? ` · 모델 ${usage.models.join(", ")}` : "";
+  return `${cost} · 토큰 ${n(usage.total)} (입력 ${n(usage.input)}, 그중 캐시 ${n(usage.cached)} · 출력 ${n(usage.output)}) · AI 호출 ${usage.calls}회${models}`;
+}
+
 async function refreshProviderStatus() {
   const requested = state.provider;
   $("llm-status").textContent = "로그인 상태 확인 중…";
@@ -148,73 +199,292 @@ async function refreshProviderStatus() {
   $("llm-status").textContent = status.message;
 }
 
-function bindProviders() {
-  const selector = $("llm-provider");
-  state.provider = selector.value || "claude";
-  selector.onchange = async () => {
-    const previous = state.provider;
-    state.providerSaving = true;
-    ++state.envRequest;
-    selector.disabled = true;
-    $("save-settings").disabled = true;
-    $("model-input").disabled = true;
-    $("llm-status").textContent = "사용할 AI를 저장하는 중…";
+const llmControls = ["llm-provider", "model-input", "effort-input"];
+
+async function saveLlmSettings(changes) {
+  state.providerSaving = true;
+  ++state.envRequest;
+  llmControls.forEach((id) => { $(id).disabled = true; });
+  $("save-settings").disabled = true;
+  $("llm-status").textContent = "AI 설정을 저장하는 중…";
+  renderSelection();
+  try {
+    const settings = await api("/api/settings", {method: "POST", body: JSON.stringify(changes)});
+    const providerChanged = settings.provider !== state.provider;
+    state.provider = settings.provider;
+    renderLlmConfig(settings.model, settings.effort);
+    if (providerChanged || "provider" in changes) await refreshProviderStatus();
+    else $("llm-status").textContent = "";
+    logLocal(`${state.provider === "codex" ? "GPT (ChatGPT 구독)" : "Claude Pro 구독"} · 모델 ${settings.model || "기본값"} · effort ${settings.effort || "기본값"}으로 저장했습니다. 진행 중인 작업은 시작할 때 선택한 설정으로 계속 실행합니다.`, "success");
+  } catch (error) {
+    $("llm-status").textContent = error.message;
+    logLocal(error.message, "error");
+    await loadEnvironment().catch(() => {});
+  } finally {
+    state.providerSaving = false;
+    llmControls.forEach((id) => { $(id).disabled = false; });
+    $("save-settings").disabled = false;
     renderSelection();
-    try {
-      const settings = await api("/api/settings", {method: "POST", body: JSON.stringify({provider: selector.value})});
-      state.provider = settings.provider;
-      $("model-input").value = settings.model || "";
-      await refreshProviderStatus();
-      logLocal(`${state.provider === "codex" ? "GPT (ChatGPT 구독)" : "Claude Pro 구독"}으로 저장했습니다. 진행 중인 작업은 시작할 때 선택한 AI로 계속 실행합니다.`, "success");
-    } catch (error) {
-      selector.value = state.provider || previous;
-      $("llm-status").textContent = error.message;
-      logLocal(error.message, "error");
-    } finally {
-      state.providerSaving = false;
-      selector.disabled = false;
-      $("save-settings").disabled = false;
-      $("model-input").disabled = false;
-      renderSelection();
-    }
-  };
+  }
+}
+
+function bindProviders() {
+  state.provider = $("llm-provider").value || "claude";
+  $("llm-provider").onchange = (event) => saveLlmSettings({provider: event.target.value});
+  $("model-input").onchange = (event) => saveLlmSettings({model: event.target.value || null});
+  $("effort-input").onchange = (event) => saveLlmSettings({effort: event.target.value || null});
   $("llm-check").onclick = guard(refreshProviderStatus);
 }
 
 /* ------------------------------------------------------------------ 목록 */
 
-function isComplete(record) {
-  return Boolean(record?.completed ?? record?.exported);
+/* 문제 하나의 진행 상태. 생성 단계는 앱이, 업로드는 사람이 정한다. */
+/* 용어
+ * 미생성: zip을 아직 만들지 않음 · 생성 실패: 실행했지만 zip을 못 만듦
+ * 재생성 필요: 문제를 고쳐 기존 zip이 맞지 않음 · 업로드 대기: zip이 있고 아직 업로드하지 않음
+ * 재업로드 필요: 업로드 완료 뒤 zip을 다시 만듦 · 업로드 완료: 지금 zip을 문제 사이트에 올렸다고 기록됨
+ * 업로드 완료만 사람이 정하고, 나머지는 생성 결과로 자동으로 정해진다. */
+const STATUS = {
+  none: {label: "미생성", tone: "gray"},
+  failed: {label: "생성 실패", tone: "red"},
+  rebuild: {label: "재생성 필요", tone: "red"},
+  ready: {label: "업로드 대기", tone: "blue"},
+  stale: {label: "재업로드 필요", tone: "orange"},
+  uploaded: {label: "업로드 완료", tone: "green"},
+};
+const STATUS_GROUPS = [
+  {title: "직접 기록", keys: ["uploaded"]},
+  {title: "업로드 전 · 자동", keys: ["ready", "stale"]},
+  {title: "생성 전 · 자동", keys: ["none", "failed", "rebuild"]},
+];
+
+const SPJ_TITLE = "스페셜 저지 문제: 정답이 여러 개일 수 있어 출력 글자 비교로는 맞는 답을 틀렸다고 채점할 수 있습니다.";
+
+function spjLabel() {
+  return `<span class="problem-label spj" title="${SPJ_TITLE}">SPJ</span>`;
 }
 
-function completionText(record) {
-  if (record?.completion_source === "manual") return isComplete(record) ? "✓ 수동 완료" : "완료 표시 해제";
-  return isComplete(record) ? "✓ 내보내기 완료" : "불러온 기록";
+function problemStatus(record) {
+  const upload = record?.upload?.status;
+  if (upload === "uploaded" || upload === "stale") return upload;
+  if (record?.exported) return "ready";
+  if (record?.status === "failed") return "failed";
+  if (record?.status === "needs_review") return "rebuild";
+  return "none";
 }
 
-function completionControl(number, record) {
-  const label = document.createElement("label"); label.className = "completion-control";
-  const checkbox = document.createElement("input"); checkbox.type = "checkbox";
-  checkbox.dataset.completeId = number;
-  checkbox.setAttribute("aria-label", `${number} 완료 표시`);
-  checkbox.checked = isComplete(record);
-  checkbox.title = "완료 표시만 변경합니다. 내보낸 파일과 실제 검증 기록은 유지됩니다.";
-  checkbox.onchange = async () => {
-    const previous = isComplete(record);
-    checkbox.disabled = true;
-    try {
-      const updated = await api(`/api/boj/${number}/completion`, {method: "PUT", body: JSON.stringify({completed: checkbox.checked})});
-      state.history[String(number)] = updated;
-      catalogPages.clear();
-      if (state.catalogPage) renderCatalog(state.catalogPage);
-      await loadProblems();
-    } catch (error) {
-      checkbox.checked = previous;
-      logLocal(error.message, "error");
-    } finally { checkbox.disabled = false; }
+function pillMarkup(key) {
+  return `<span class="dot" aria-hidden="true"></span>${escapeHtml(STATUS[key].label)}`;
+}
+
+function statusTitle(key, record) {
+  const when = record?.upload?.uploaded_at ? `${formatDate(record.upload.uploaded_at)} 업로드 완료 기록. ` : "";
+  if (key === "stale") return `${when}그 뒤 zip을 다시 만들었습니다. 새 zip을 내려받아 다시 업로드하세요.`;
+  if (key === "uploaded") return `${when}눌러서 상태를 바꿀 수 있습니다.`;
+  if (key === "ready") return "zip이 있습니다. 내려받아 문제 사이트에 업로드한 뒤 업로드 완료로 기록하세요.";
+  if (key === "rebuild") return "문제를 수정해서 기존 zip이 맞지 않습니다. 다시 실행해 zip을 만드세요.";
+  return "눌러서 상태를 바꿀 수 있습니다.";
+}
+
+function statusPill(number, record) {
+  const key = problemStatus(record);
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `status-pill tone-${STATUS[key].tone}`;
+  button.innerHTML = pillMarkup(key);
+  button.title = statusTitle(key, record);
+  button.setAttribute("aria-haspopup", "menu");
+  button.setAttribute("aria-label", `${number} 상태 ${STATUS[key].label}, 눌러서 변경`);
+  button.onclick = (event) => {
+    event.stopPropagation();
+    openStatusMenu(button, number, record, key);
   };
-  label.append(checkbox, document.createTextNode("완료"));
-  return label;
+  return button;
+}
+
+function closeStatusMenu(restoreFocus = false) {
+  const menu = $("status-menu");
+  if (menu.hidden) return;
+  menu.hidden = true;
+  if (restoreFocus) state.statusMenuAnchor?.focus();
+  state.statusMenuAnchor = null;
+}
+
+function openStatusMenu(anchor, number, record, current) {
+  const menu = $("status-menu");
+  if (!menu.hidden && state.statusMenuAnchor === anchor) { closeStatusMenu(true); return; }
+  state.statusMenuAnchor = anchor;
+  menu.innerHTML = "";
+  const head = document.createElement("div"); head.className = "status-menu-current";
+  head.innerHTML = `<span class="status-pill tone-${STATUS[current].tone}">${pillMarkup(current)}</span>`;
+  menu.appendChild(head);
+  STATUS_GROUPS.forEach((group) => {
+    const title = document.createElement("div"); title.className = "status-menu-group"; title.textContent = group.title;
+    menu.appendChild(title);
+    group.keys.forEach((key) => {
+      const item = document.createElement("button");
+      item.type = "button"; item.className = "status-menu-item"; item.setAttribute("role", "menuitem");
+      item.innerHTML = `<span class="status-pill tone-${STATUS[key].tone}">${pillMarkup(key)}</span>` +
+        (key === current ? '<span class="status-menu-check" aria-label="현재 상태">✓</span>' : "");
+      // 사람이 고를 수 있는 건 "업로드 완료"뿐이다. 나머지는 생성 결과로 정해진다.
+      const selectable = key === "uploaded" && current !== "uploaded";
+      item.disabled = !selectable;
+      if (!selectable && key !== current) item.title = "앱이 생성 결과에 따라 자동으로 정합니다.";
+      if (selectable) item.onclick = guard(() => setUploaded(number, true));
+      menu.appendChild(item);
+    });
+  });
+  if (current === "uploaded" || current === "stale") {
+    const rule = document.createElement("hr"); menu.appendChild(rule);
+    const clear = document.createElement("button");
+    clear.type = "button"; clear.className = "status-menu-item danger-text"; clear.setAttribute("role", "menuitem");
+    clear.textContent = "업로드 완료 취소";
+    clear.onclick = guard(async () => {
+      if (!window.confirm(`${number}번의 업로드 완료 기록을 취소할까요?\n\n문제 사이트에 올라간 문제는 그대로이고, 이 앱의 기록만 지웁니다.`)) return;
+      await setUploaded(number, false);
+    });
+    menu.appendChild(clear);
+  }
+  menu.hidden = false;
+  const box = anchor.getBoundingClientRect();
+  const width = menu.offsetWidth, height = menu.offsetHeight;
+  const left = Math.min(Math.max(8, box.right - width), window.innerWidth - width - 8);
+  const below = box.bottom + 6 + height <= window.innerHeight - 8;
+  menu.style.left = `${left}px`;
+  menu.style.top = `${below ? box.bottom + 6 : Math.max(8, box.top - height - 6)}px`;
+  menu.querySelector(".status-menu-item:not(:disabled)")?.focus();
+}
+
+async function setUploaded(number, uploaded) {
+  closeStatusMenu();
+  const updated = await api(`/api/boj/${number}/upload`, {method: "PUT", body: JSON.stringify({uploaded})});
+  state.history[String(number)] = updated;
+  logLocal(uploaded ? `${number}번을 업로드 완료로 기록했습니다.` : `${number}번의 업로드 완료 기록을 취소했습니다.`, "success");
+  await refreshUploadViews();
+}
+
+function bindStatusMenu() {
+  document.addEventListener("click", (event) => {
+    if (!$("status-menu").contains(event.target)) closeStatusMenu();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeStatusMenu(true);
+  });
+  window.addEventListener("resize", () => closeStatusMenu());
+  window.addEventListener("scroll", () => closeStatusMenu(), true);
+}
+
+async function refreshUploadViews() {
+  catalogPages.clear();
+  await loadHistory();
+  // 상태가 바뀌면 필터에 걸리는 문제와 개수도 달라진다.
+  await loadCatalog(true);
+  await loadUploadLog();
+}
+
+/* 내려받을 zip을 서버에 기록한 뒤 내려받고, 올렸는지 확인받는다. */
+async function downloadForUpload(target) {
+  const result = await api("/api/upload-manifests", {method: "POST", body: JSON.stringify(target)});
+  const link = document.createElement("a");
+  link.href = result.download_url; link.download = "";
+  document.body.appendChild(link); link.click(); link.remove();
+  if (!result.manifest) return;
+  await loadUploadLog();
+  openUploadDialog(result.manifest);
+}
+
+function openUploadDialog(manifest) {
+  state.uploadManifest = manifest;
+  const confirmed = new Set(manifest.confirmed || []);
+  const list = $("upload-dialog-items"); list.innerHTML = "";
+  manifest.items.forEach((item) => {
+    const li = document.createElement("li");
+    const label = document.createElement("label");
+    const box = document.createElement("input"); box.type = "checkbox";
+    box.value = item.problem_id;
+    box.checked = !confirmed.has(item.problem_id);
+    box.disabled = confirmed.has(item.problem_id);
+    box.onchange = updateUploadDialog;
+    const text = document.createElement("span");
+    text.textContent = `${item.problem_id} · ${item.title || "제목 없음"}${confirmed.has(item.problem_id) ? " (업로드 완료 기록됨)" : ""}`;
+    label.append(box, text); li.appendChild(label); list.appendChild(li);
+  });
+  $("upload-dialog-when").textContent = `${formatDate(manifest.created_at)}에 내려받은 ${manifest.kind === "batch" ? "묶음" : "문제"} zip · ${manifest.items.length}개`;
+  $("upload-dialog-error").textContent = "";
+  updateUploadDialog();
+  $("upload-dialog").showModal();
+}
+
+function uploadDialogChecks() {
+  return [...document.querySelectorAll("#upload-dialog-items input:not(:disabled)")];
+}
+
+function updateUploadDialog() {
+  const count = uploadDialogChecks().filter((box) => box.checked).length;
+  $("upload-confirm").textContent = count ? `${count}개 업로드 완료로 기록` : "기록할 문제를 체크하세요";
+  $("upload-confirm").disabled = !count;
+  $("upload-toggle-all").textContent = uploadDialogChecks().every((box) => box.checked) ? "모두 해제" : "모두 체크";
+}
+
+function bindUploadDialog() {
+  $("upload-toggle-all").onclick = () => {
+    const checks = uploadDialogChecks();
+    const next = !checks.every((box) => box.checked);
+    checks.forEach((box) => { box.checked = next; });
+    updateUploadDialog();
+  };
+  $("upload-later").onclick = () => $("upload-dialog").close();
+  $("upload-confirm").onclick = async () => {
+    const manifest = state.uploadManifest;
+    const ids = uploadDialogChecks().filter((box) => box.checked).map((box) => Number(box.value));
+    if (!manifest || !ids.length) return;
+    $("upload-confirm").disabled = true;
+    try {
+      await api(`/api/upload-manifests/${encodeURIComponent(manifest.id)}/confirm`,
+        {method: "POST", body: JSON.stringify({problem_ids: ids})});
+      $("upload-dialog").close();
+      logLocal(`${ids.length}개를 업로드 완료로 기록했습니다.`, "success");
+      await refreshUploadViews();
+    } catch (error) {
+      $("upload-dialog-error").textContent = error.message;
+      updateUploadDialog();
+    }
+  };
+}
+
+async function loadUploadLog() {
+  const {manifests} = await api("/api/upload-manifests?limit=10");
+  $("upload-log").hidden = !manifests.length;
+  const list = $("upload-log-items"); list.innerHTML = "";
+  manifests.forEach((manifest) => {
+    const done = manifest.confirmed.length, total = manifest.items.length;
+    const li = document.createElement("li");
+    li.dataset.state = done === total ? "done" : done ? "partial" : "pending";
+    const title = document.createElement("strong");
+    const progress = done === total ? "✓ 모두 업로드 완료" : done ? `${done}/${total}개 업로드 완료` : "업로드 기록 전";
+    title.textContent = `${formatDate(manifest.created_at)} · ${manifest.kind === "batch" ? "묶음" : "문제"} ${total}개 · ${progress}`;
+    const detail = document.createElement("div"); detail.className = "hint";
+    detail.textContent = manifest.items.map((item) => `${item.problem_id} ${item.title || ""}`.trim()).join(", ");
+    li.append(title, detail);
+    if (done < total) {
+      const record = document.createElement("button"); record.className = "secondary";
+      record.textContent = "업로드 완료 기록";
+      record.onclick = () => openUploadDialog(manifest);
+      li.appendChild(record);
+    }
+    if (done) {
+      const undo = document.createElement("button"); undo.className = "secondary";
+      undo.textContent = "기록 취소";
+      undo.onclick = guard(async () => {
+        if (!window.confirm(`이 내려받기로 남긴 업로드 완료 기록 ${done}개를 취소할까요?\n\n그 뒤 다른 내려받기로 다시 기록한 문제는 그대로 둡니다.`)) return;
+        await api(`/api/upload-manifests/${encodeURIComponent(manifest.id)}/undo`, {method: "POST"});
+        logLocal(`업로드 완료 기록 ${done}개를 취소했습니다.`, "success");
+        await refreshUploadViews();
+      });
+      li.appendChild(undo);
+    }
+    list.appendChild(li);
+  });
 }
 
 
@@ -230,13 +500,14 @@ async function loadProblems() {
     button.innerHTML =
       `${escapeHtml(item.title)}<span class="meta">케이스 ${item.case_count}건 · ` +
       `${item.solution_confirmed ? "정답 확정" : "미확정"}</span>` +
-      `<span class="meta ${isComplete(item.history) ? "export-done" : ""}">${escapeHtml(completionText(item.history))}${item.history?.completed_at || item.history?.created_at ? " · " + escapeHtml(formatDate(item.history.completed_at || item.history.created_at)) : ""}</span>`;
+      (item.history?.exported_at || item.history?.created_at
+        ? `<span class="meta">${escapeHtml(formatDate(item.history.exported_at || item.history.created_at))}</span>` : "");
     button.title = item.history?.error || "";
     button.onclick = () => selectProblem(item.slug);
     li.appendChild(button);
     if (item.boj_id) {
       li.className = "saved-row";
-      li.appendChild(completionControl(item.boj_id, state.history[String(item.boj_id)] || item.history));
+      li.appendChild(statusPill(item.boj_id, state.history[String(item.boj_id)] || item.history));
     }
     list.appendChild(li);
   });
@@ -273,14 +544,16 @@ async function refresh() {
   const link = $("download-link");
   link.hidden = !payload.has_zip;
   link.href = `/api/problems/${encodeURIComponent(state.slug)}/download`;
+  link.onclick = guard(() => downloadForUpload({slug: state.slug}));
 }
 
 function fetchCatalogPage(query, offset, force = false) {
-  const key = JSON.stringify([query, offset]);
+  const status = state.catalogStatus || "all";
+  const key = JSON.stringify([query, offset, status]);
   const cached = catalogPages.get(key);
   if (!force && cached && Date.now() - cached.time < CATALOG_CACHE_MS) return cached.promise;
   const entry = { time: Date.now() };
-  entry.promise = api(`/api/boj?offset=${offset}&limit=${CATALOG_PAGE_SIZE}&q=${encodeURIComponent(query)}`)
+  entry.promise = api(`/api/boj?offset=${offset}&limit=${CATALOG_PAGE_SIZE}&q=${encodeURIComponent(query)}&status=${status}`)
     .catch((error) => {
       if (catalogPages.get(key) === entry) catalogPages.delete(key);
       throw error;
@@ -302,13 +575,37 @@ async function loadCatalog(force = false) {
   }
 }
 
+const filterLabels = {all: "전체", uploaded: "업로드 완료", pending_upload: "업로드 대기", not_uploaded: "미업로드"};
+
+function renderCatalogFilter(counts) {
+  document.querySelectorAll("#catalog-filter [data-status]").forEach((button) => {
+    const status = button.dataset.status;
+    button.setAttribute("aria-pressed", String(status === (state.catalogStatus || "all")));
+    const count = counts?.[status];
+    button.textContent = Number.isInteger(count) ? `${filterLabels[status]} ${count.toLocaleString()}` : filterLabels[status];
+  });
+}
+
+function bindCatalogFilter() {
+  document.querySelectorAll("#catalog-filter [data-status]").forEach((button) => {
+    button.onclick = guard(async () => {
+      state.catalogStatus = button.dataset.status;
+      state.catalogOffset = 0;
+      renderCatalogFilter(state.catalogPage?.counts);
+      await loadCatalog();
+    });
+  });
+}
+
 function renderCatalog(result) {
   state.catalogPage = result;
+  renderCatalogFilter(result.counts);
   const offset = result.offset;
   const hasTotal = Number.isInteger(result.total);
   const hasMore = hasTotal ? offset + CATALOG_PAGE_SIZE < result.total : result.has_more;
   state.catalogTotal = result.total;
-  $("catalog-status").textContent = !result.items.length ? "검색 결과가 없습니다."
+  $("catalog-status").textContent = !result.items.length
+    ? ((state.catalogStatus || "all") === "all" ? "검색 결과가 없습니다." : `${filterLabels[state.catalogStatus]} 문제가 없습니다.`)
     : hasTotal ? `전체 ${result.total.toLocaleString()}개 · ${offset + 1}–${offset + result.items.length} · ${Math.floor(offset / CATALOG_PAGE_SIZE) + 1}/${Math.ceil(result.total / CATALOG_PAGE_SIZE)}페이지`
     : `${offset + 1}–${offset + result.items.length}개`;
   $("catalog-prev").disabled = offset === 0;
@@ -328,10 +625,10 @@ function renderCatalog(result) {
     button.type = "button";
     button.dataset.bojId = item.problem_id;
     const record = state.history[String(item.problem_id)] || item.history;
-    button.innerHTML = `${escapeHtml(item.problem_id)} · ${escapeHtml(item.title)}` +
-      (record ? `<span class="meta ${isComplete(record) ? "export-done" : ""}">${escapeHtml(completionText(record))}${isComplete(record) && record.completed_at ? " · " + escapeHtml(formatDate(record.completed_at)) : ""}</span>` : "");
+    button.innerHTML = `<span class="problem-number">${escapeHtml(item.problem_id)}</span>` +
+      `<span class="problem-name">${escapeHtml(item.title)}${item.special_judge ? spjLabel() : ""}</span>`;
     button.onclick = guard(() => previewBoj(item.problem_id));
-    li.append(checkbox, button, completionControl(item.problem_id, record)); list.appendChild(li);
+    li.append(checkbox, button, statusPill(item.problem_id, record)); list.appendChild(li);
   });
   highlightPreview();
   renderSelection();
@@ -353,6 +650,8 @@ async function loadHistory() {
   const payload = await api("/api/history");
   state.history = payload.by_problem || {};
   if (state.catalogPage) renderCatalog(state.catalogPage);
+  // 대기열의 상태 표시도 기록을 받은 뒤 다시 그린다.
+  if (state.batch) renderBatch(state.batch);
   await loadProblems();
 }
 
@@ -386,7 +685,7 @@ function renderSelection() {
     selected.appendChild(chip);
   });
   const previewSelected = state.selected.has(state.previewId);
-  $("preview-select").textContent = previewSelected ? "선택 목록에서 제외" : "선택 목록에 추가";
+  $("preview-select").textContent = previewSelected ? "실행 목록에서 제외" : "실행 목록에 추가";
   $("preview-select").setAttribute("aria-pressed", String(previewSelected));
   $("preview-select").disabled = !state.previewId || (!previewSelected && state.selected.size >= 30);
   $("batch-start").textContent = state.batch?.running ? "실행 상황 보기" : "선택한 문제 실행하기";
@@ -399,8 +698,8 @@ function renderSelection() {
 }
 
 const batchLabels = {
-  pending: "대기", running: "실행 중", exported: "✓ 내보내기 완료", failed: "실패",
-  skipped: "✓ 완료 표시로 건너뜀", cancelled: "중단", interrupted: "서버 종료로 중단",
+  pending: "대기", running: "실행 중", exported: "✓ 생성 완료", failed: "실패",
+  skipped: "건너뜀 (이미 생성됨)", cancelled: "중단", interrupted: "서버 종료로 중단",
   done: "실행 완료", cancelling: "중단 중", idle: "대기",
 };
 
@@ -416,18 +715,37 @@ function renderBatch(batch) {
   $("batch-progress").max = batch.items?.length || 1;
   $("batch-progress").value = finished;
   $("batch-progress").setAttribute("aria-valuetext", `${batch.items?.length || 0}개 중 ${finished}개 처리`);
-  $("batch-summary").textContent = `${batchLabels[batch.status] || batch.status}${batch.llm?.provider ? ` · ${batch.llm.provider === "codex" ? "GPT" : "Claude"}` : ""} · 전체 ${batch.items?.length || 0}개 · 내보내기 ${counts.exported || 0} · 건너뜀 ${counts.skipped || 0} · 실패 ${counts.failed || 0} · 대기 ${counts.pending || 0}`;
+  const llm = batch.llm?.provider
+    ? ` · ${batch.llm.provider === "codex" ? "GPT" : "Claude"} (모델 ${batch.llm.model || "기본값"}, effort ${batch.llm.effort || "기본값"})` : "";
+  const used = (batch.items || []).filter((item) => item.usage?.calls);
+  const totalCost = used.reduce((sum, item) => sum + (item.usage.cost_usd || 0), 0);
+  const unpriced = used.some((item) => item.usage.unpriced_calls);
+  const tokens = used.length
+    ? ` · API 환산 합계 ${formatUsd(totalCost)}${unpriced ? " 이상" : ""} · 토큰 ${used.reduce((sum, item) => sum + item.usage.total, 0).toLocaleString("ko-KR")}` : "";
+  const batchElapsed = formatDuration(elapsedSeconds(batch.created_at, batch.running ? null : batch.finished_at));
+  const elapsed = batchElapsed ? ` · ${batch.running ? "경과" : "총 소요"} ${batchElapsed}` : "";
+  $("batch-summary").textContent = `${batchLabels[batch.status] || batch.status}${elapsed}${llm}${tokens} · 전체 ${batch.items?.length || 0}개 · 내보내기 ${counts.exported || 0} · 건너뜀 ${counts.skipped || 0} · 실패 ${counts.failed || 0} · 대기 ${counts.pending || 0}`;
   const list = $("batch-items"); list.innerHTML = "";
   (batch.items || []).forEach((item) => {
     const li = document.createElement("li");
     li.dataset.status = item.status;
     const label = document.createElement("strong");
-    label.textContent = `${item.problem_id} · ${item.title} — ${batchLabels[item.status] || item.status}`;
+    const itemElapsed = item.started_at && (item.status === "running" || item.finished_at)
+      ? formatDuration(elapsedSeconds(item.started_at, item.status === "running" ? null : item.finished_at)) : "";
+    const timing = itemElapsed ? ` (${item.status === "running" ? `${itemElapsed} 경과` : `소요 ${itemElapsed}`})` : "";
+    label.textContent = `${item.problem_id} · ${item.title} — ${batchLabels[item.status] || item.status}${timing}`;
+    if (item.special_judge) label.insertAdjacentHTML("beforeend", spjLabel());
     label.className = item.status === "exported" || item.status === "skipped" ? "export-done" : "";
     li.appendChild(label);
     const detail = document.createElement("div"); detail.className = "hint";
     detail.textContent = item.error || item.message || item.stage || "";
     li.appendChild(detail);
+    // 문제 하나가 끝난 뒤에만 그 문제에서 쓴 토큰을 보여 준다.
+    if (!["pending", "running"].includes(item.status) && item.usage?.calls) {
+      const usage = document.createElement("div"); usage.className = "hint batch-usage";
+      usage.textContent = formatUsage(item.usage);
+      li.appendChild(usage);
+    }
     if (item.slug) {
       const button = document.createElement("button"); button.className = "secondary";
       button.textContent = "작업 열기"; button.onclick = guard(() => selectProblem(item.slug));
@@ -436,7 +754,9 @@ function renderBatch(batch) {
         const link = document.createElement("a"); link.className = "button-link";
         link.textContent = "zip 내려받기";
         link.href = `/api/problems/${encodeURIComponent(item.slug)}/download`;
+        link.onclick = guard(() => downloadForUpload({slug: item.slug}));
         li.appendChild(link);
+        li.appendChild(statusPill(item.problem_id, state.history[String(item.problem_id)]));
       }
     }
     list.appendChild(li);
@@ -444,6 +764,7 @@ function renderBatch(batch) {
   const bundle = $("batch-download");
   bundle.hidden = !batch.bundle_count;
   bundle.href = `/api/batches/${encodeURIComponent(batch.id || "")}/download`;
+  bundle.onclick = guard(() => downloadForUpload({batch_id: batch.id}));
   bundle.textContent = `완료 문제 ${batch.bundle_count || 0}개 묶음 내려받기`;
   $("batch-retry").hidden = batch.running || !(batch.items || []).some((item) => !["exported", "skipped"].includes(item.status));
   renderSelection();
@@ -547,23 +868,35 @@ async function previewBoj(number) {
   renderSelection();
   const problem = payload.problem;
   $("catalog-preview").hidden = false;
+  $("catalog-close").hidden = false;
   $("preview-title").textContent = `${number} · ${problem.title}`;
-  $("preview-limits").textContent = `${problem.limits.time_ms}ms · ${problem.limits.memory_mb}MB · 그림 ${problem.figures.length}개`;
+  $("preview-limits").textContent = `시간 제한 ${problem.limits.time_ms.toLocaleString()}ms · 메모리 ${problem.limits.memory_mb}MB` + (problem.figures.length ? ` · 그림 ${problem.figures.length}개` : "");
   const figures = payload.figure_preview || { status: problem.figures.length ? "missing" : "none", images: {} };
   state.previewKey = figures.key;
   renderPreviewImages(figures);
   if (figures.status === "downloading") schedulePreviewImages(number, figures.key);
   const body = $("preview-body"); body.innerHTML = "";
-  const sections = [["문제", problem.statement], ["입력", inputDescription(problem)], ["출력", problem.output_spec], ["힌트", problem.hints]];
-  (problem.examples || []).forEach((example, i) => sections.push([`예제 ${i + 1}`, `입력\n${example.input}\n출력\n${example.output}`]));
+  const sections = [["문제", problem.statement], ["입력", inputDescription(problem)], ["출력", problem.output_spec]];
   if (payload.notes.length) sections.push(["직접 보완할 항목", payload.notes.join("\n")]);
   sections.forEach(([title, text]) => {
+    if (!text?.trim()) return;
     const h = document.createElement("h3"); h.textContent = title;
-    const pre = document.createElement("pre"); pre.className = "preview";
-    pre.textContent = text || "수집본에 없음 · 작업 시작 후 직접 입력하세요.";
-    body.append(h, pre);
+    const prose = document.createElement("div"); prose.className = "problem-prose";
+    prose.textContent = text;
+    body.append(h, prose);
   });
-  if (state.view === "home" && window.matchMedia("(max-width: 850px)").matches) {
+  (problem.examples || []).forEach((example, index) => {
+    const heading = document.createElement("h3"); heading.textContent = `예제 ${index + 1}`;
+    const sample = document.createElement("div"); sample.className = "sample-grid";
+    for (const [label, value] of [["입력", example.input], ["출력", example.output]]) {
+      const block = document.createElement("div");
+      const title = document.createElement("h4"); title.textContent = label;
+      const code = document.createElement("pre"); code.className = "sample-code"; code.textContent = value;
+      block.append(title, code); sample.appendChild(block);
+    }
+    body.append(heading, sample);
+  });
+  if (state.view === "home" && window.matchMedia("(max-width: 900px)").matches) {
     $("catalog-preview").closest(".preview-pane").scrollIntoView({block: "start"});
   }
 }
@@ -607,10 +940,11 @@ function closeCatalogPreview() {
   clearTimeout(state.previewTimer);
   state.previewId = null; state.previewKey = null;
   $("catalog-preview").hidden = true;
+  $("catalog-close").hidden = true;
   $("preview-notice").textContent = "";
   highlightPreview();
   renderSelection();
-  if (state.view === "home" && window.matchMedia("(max-width: 850px)").matches) {
+  if (state.view === "home" && window.matchMedia("(max-width: 900px)").matches) {
     $("catalog-list").closest(".catalog-panel").scrollIntoView({block: "start"});
   }
 }
@@ -920,7 +1254,7 @@ function renderLogEvent(event) {
         if (Number.isFinite(data[key])) group[key] = data[key];
       }
     }
-    if (detail && state.logDetails) list.appendChild(logRow(event));
+    if (detail && state.logDetails) list.prepend(logRow(event));
     if (!detail || !state.logDetails) {
       const summary = group.accepted === null ? "테스트케이스 생성·검증 중" : `확정 ${group.accepted}/${group.target}개 · 제외 ${group.rejected}개`;
       const replacement = logRow(event, summary); replacement.classList.add("case-progress");
@@ -928,22 +1262,28 @@ function renderLogEvent(event) {
       note.textContent = `생성 ${group.generated}회 · 입력 심사 ${group.reviewed}회 · 생성기·seed는 상세 보기에서 확인`;
       replacement.querySelector(".log-message").appendChild(note);
       if (group.row?.isConnected) group.row.remove();
-      group.row = replacement; list.appendChild(replacement);
+      group.row = replacement; list.prepend(replacement);
     }
   } else {
-    list.appendChild(logRow(event));
+    list.prepend(logRow(event));
     if (event.stage !== "cases" || data.kind === "case_complete" || ["success", "error"].includes(event.level)) state.caseLog = null;
   }
-  while (list.children.length > 400) list.firstElementChild.remove();
+  while (list.children.length > 400) list.lastElementChild.remove();
 }
 
 function appendLog(event) {
   const list = $("log");
-  const follow = list.scrollHeight - list.scrollTop - list.clientHeight < 50;
+  const follow = list.scrollTop < 50;
+  const viewportTop = list.getBoundingClientRect().top;
+  const anchor = follow ? null : Array.from(list.children).find((row) => row.getBoundingClientRect().bottom > viewportTop);
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  const previousScrollTop = list.scrollTop;
   state.logEvents.push(event);
   if (state.logEvents.length > 2000) state.logEvents.shift();
   renderLogEvent(event);
-  if (follow) list.scrollTop = list.scrollHeight;
+  if (follow) list.scrollTop = 0;
+  else if (anchor?.isConnected) list.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+  else list.scrollTop = previousScrollTop;
 }
 
 function clearLog() {
@@ -954,7 +1294,7 @@ function toggleLogDetails() {
   state.logDetails = $("log-details").checked;
   state.caseLog = null; $("log").innerHTML = "";
   state.logEvents.forEach(renderLogEvent);
-  $("log").scrollTop = $("log").scrollHeight;
+  $("log").scrollTop = 0;
 }
 
 /* ------------------------------------------------------------------ 동작 */
@@ -1005,7 +1345,7 @@ async function saveProblem() {
 }
 
 function bindCatalog() {
-  $("home-button").onclick = $("back-to-home").onclick = () => showView("home");
+  $("home-button").onclick = () => showView("home");
   $("execution-button").onclick = () => showView("execution");
   window.addEventListener("popstate", () => showView(location.hash.slice(1), false));
   showView(location.hash.slice(1), false);
@@ -1016,6 +1356,9 @@ function bindCatalog() {
   };
   bindBatch();
   bindProviders();
+  bindUploadDialog();
+  bindStatusMenu();
+  bindCatalogFilter();
   $("saved-work").ontoggle = guard(loadProblems);
   $("catalog-search").onsubmit = guard(async () => { state.catalogOffset = 0; await loadCatalog(true); });
   $("catalog-prev").onclick = guard(async () => { state.catalogOffset = Math.max(0, state.catalogOffset - CATALOG_PAGE_SIZE); await loadCatalog(); });
@@ -1088,8 +1431,7 @@ function bind() {
   $("save-settings").onclick = guard(async () => {
     await api("/api/settings", {
       method: "POST",
-      body: JSON.stringify({ provider: state.provider, model: $("model-input").value.trim() || null,
-        drive_folder: $("drive-folder").value.trim() }),
+      body: JSON.stringify({ drive_folder: $("drive-folder").value.trim() }),
     });
     logLocal("설정을 저장했습니다.", "success");
     await loadEnvironment();
@@ -1137,4 +1479,5 @@ requestAnimationFrame(() => setTimeout(() => {
   });
   loadEnvironment().catch((error) => logLocal(error.message, "error"));
   pollBatch();
+  loadUploadLog().catch((error) => logLocal(error.message, "warn"));
 }, 0));

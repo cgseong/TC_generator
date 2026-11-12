@@ -168,7 +168,10 @@ def test_api_history_marks_catalog_without_delaying_root_for_workspace_scan(clie
     assert client.get("/api/history").json()["by_problem"]["1000"]["exported"]
     monkeypatch.setattr(history, "list_workspaces", lambda **kwargs: pytest.fail("root must not scan workspaces"))
     html = client.get("/").text
-    assert "✓ 내보내기 완료" in html and 'data-select-id="1000"' in html
+    assert '<span class="status-pill tone-blue"><span class="dot"></span>업로드 대기</span>' in html
+    assert 'data-select-id="1000"' in html
+    # 첫 화면에도 완료 체크박스를 두지 않는다. 실행 선택 체크박스만 있다.
+    assert "data-complete-id" not in html
     item = client.get("/api/boj").json()["items"][0]
     assert item["history"]["slug"] == ws.slug
 

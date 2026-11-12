@@ -1,5 +1,6 @@
 """문제 묶음 스키마, 그림 위치, 평가 기준, 예제와 완료 표시 회귀 검사."""
 import copy
+import dataclasses
 import io
 import json
 import threading
@@ -35,7 +36,7 @@ def ready_workspace(root, number=1000, **changes):
 
 def export_metadata(ws):
     result = metadata.normalize_classification(assessment())
-    return {**result, **metadata.select_samples(ws, object())}
+    return {**result, **metadata.original_samples(ws.load_problem())}
 
 
 def successful_export(ws):
@@ -105,7 +106,7 @@ def test_problem_archive_matches_attached_structure_and_constants(tmp_path):
     assert payload["spj"] is None and payload["rule_type"] == "ACM"
     assert payload["time_limit"] == ws.load_problem().limits.time_ms
     assert payload["memory_limit"] == ws.load_problem().limits.memory_mb
-    assert len(payload["samples"]) == 3
+    assert payload["samples"] == [{"input": "1 2\n", "output": "3\n"}]
     for sample in payload["samples"]:
         assert int(sample["output"]) == sum(map(int, sample["input"].split()))
 
@@ -135,22 +136,20 @@ def test_large_cases_are_excluded_from_user_facing_samples(tmp_path):
     ws = ready_workspace(tmp_path)
     large = exporter.write_case(ws.cases_dir, 4, b"1 " * 10000, b"10000", label="scale")
     ws.save_cases_index((*ws.load_cases_index(), large))
-    selected = metadata.select_samples(ws, object())
-    assert 2 <= len(selected["samples"]) <= 4
-    assert all(len(sample["input"].encode()) <= 4096 for sample in selected["samples"])
-    assert all(source["case_index"] != 4 for source in selected["sample_sources"])
+    selected = metadata.original_samples(ws.load_problem())
+    assert len(selected["samples"]) == 1
+    assert selected["samples"] == [{"input": "1 2\n", "output": "3\n"}]
+    assert all(source["purpose"] == "original" for source in selected["sample_sources"])
 
 
-def test_generated_sample_mismatch_blocks_export(tmp_path):
-    ws = create_workspace(make_problem(solution_confirmed=True), base_dir=tmp_path)
-    (ws.gens_dir / "stress_gen.py").write_text("# fake")
-    class Executor:
-        def run_script(self, *args, **kwargs):
-            return RunResult(verdict=Verdict.OK, stdout=b"3 4\n")
-        def run_on_bytes(self, path, *args, **kwargs):
-            return RunResult(verdict=Verdict.OK, stdout=b"8" if path.name == "brute.py" else b"7")
-    with pytest.raises(metadata.MetadataError, match="불일치"):
-        metadata.select_samples(ws, Executor())
+def test_missing_original_samples_block_metadata_without_generating_replacements(tmp_path):
+    from tcgen.engine.pipeline import Pipeline
+    ws = ready_workspace(tmp_path, examples=())
+    cli = FakeCLI({})
+    pipeline = Pipeline(ws, cli)
+    with pytest.raises(metadata.MetadataError, match="원문 예제가 없습니다"):
+        pipeline.prepare_export_metadata(final_checked=True)
+    assert cli.calls == []
 
 
 def test_bundled_problems_have_contiguous_folders_and_no_metadata_loss(tmp_path):
@@ -174,32 +173,94 @@ def test_incomplete_problem_zip_is_rejected(tmp_path):
         problem_export.bundle([path], tmp_path / "invalid.zip")
 
 
-def test_manual_uncheck_persists_but_does_not_delete_archive(tmp_path):
+def test_upload_mark_is_separate_from_export_and_does_not_delete_archive(tmp_path):
     ws = ready_workspace(tmp_path)
     path = successful_export(ws)
-    history.set_completion(tmp_path, 1000, False)
     item = history.snapshot(tmp_path, synchronize=True)[0]
-    assert not item["completed"] and item["exported"] and path.is_file()
-    assert history.by_problem(tmp_path)["1000"]["completion_source"] == "manual"
-    assert history.set_completion(tmp_path, 1000, True)["completed"]
-    history.set_completion(tmp_path, 1000, False)
-    history.record(ws, exported=True)
-    assert history.get(ws)["completed"] and history.get(ws)["completion_source"] == "automatic"
+    # zip이 준비된 것과 올린 것은 다르다.
+    assert item["exported"] and item["upload"]["status"] == "none" and item["completed"]
+    marked = history.set_uploaded(tmp_path, 1000, True)
+    assert marked["upload"]["status"] == "uploaded" and marked["upload"]["source"] == "manual"
+    cleared = history.set_uploaded(tmp_path, 1000, False)
+    assert cleared["upload"]["status"] == "none" and cleared["exported"] and path.is_file()
 
 
-def test_manual_completion_without_export_is_not_faked_as_verified(tmp_path):
-    item = history.set_completion(tmp_path, 1000, True, title="수동 완료")
+def test_manual_upload_without_export_is_not_faked_as_verified(tmp_path):
+    item = history.set_uploaded(tmp_path, 1000, True, title="수동 업로드")
     assert item["completed"] and not item["exported"] and item["slug"] == ""
-    assert history.by_problem(tmp_path)["1000"]["completed"]
+    assert history.by_problem(tmp_path)["1000"]["upload"]["status"] == "uploaded"
 
 
-def test_completion_api_and_batch_skip_use_user_decision(client, collection, tmp_path):
-    assert client.put("/api/boj/1000/completion", json={"completed": True}).json()["completed"]
+def test_upload_api_and_batch_skip_use_user_decision(client, collection, tmp_path):
+    assert client.put("/api/boj/1000/upload", json={"uploaded": True}).json()["upload"]["status"] == "uploaded"
     result = server._execute_batch_item(1000, threading.Event(), lambda **kw: None, True)
-    assert result["status"] == "skipped" and result["has_zip"] is False
-    assert client.put("/api/boj/1000/completion", json={"completed": False}).json()["completed"] is False
-    assert client.get("/api/boj").json()["items"][0]["history"]["completed"] is False
-    assert client.put("/api/boj/9999/completion", json={"completed": True}).status_code == 404
+    assert result["status"] == "skipped" and result["has_zip"] is False and result["message"] == "업로드 완료된 문제"
+    assert client.put("/api/boj/1000/upload", json={"uploaded": False}).json()["completed"] is False
+    assert not (client.get("/api/boj").json()["items"][0]["history"] or {}).get("completed")
+    assert client.put("/api/boj/9999/upload", json={"uploaded": True}).status_code == 404
+
+
+def test_old_manual_completion_marks_become_upload_records(tmp_path):
+    (tmp_path / ".tcgen-history.json").write_text(json.dumps({"version": 2, "entries": {}, "completion_overrides": {
+        "1000": {"completed": True, "updated_at": "2026-11-01T00:00:00+00:00", "title": "A"},
+        "1001": {"completed": False, "updated_at": "2026-11-01T00:00:00+00:00", "title": "B"}}}))
+    result = history.by_problem(tmp_path)
+    assert result["1000"]["upload"] == {"status": "uploaded", "uploaded_at": "2026-11-01T00:00:00+00:00",
+                                        "manifest": None, "source": "legacy"}
+    assert "1001" not in result
+    history.set_uploaded(tmp_path, 1000, False)
+    # 지운 예전 표시가 다시 살아나지 않는다.
+    assert "1000" not in history.by_problem(tmp_path)
+
+
+def test_bundle_upload_confirmation_records_downloaded_zip_and_flags_reexport(client, tmp_path):
+    first, second = ready_workspace(tmp_path, 1000), ready_workspace(tmp_path, 1001)
+    successful_export(first); successful_export(second)
+    server._batch_manager()._state = {"id": "b1", "status": "done", "items": [
+        {"problem_id": 1000, "title": "A", "status": "exported", "slug": first.slug},
+        {"problem_id": 1001, "title": "B", "status": "exported", "slug": second.slug}]}
+    created = client.post("/api/upload-manifests", json={"batch_id": "b1"}).json()
+    assert created["download_url"] == "/api/batches/b1/download"
+    manifest = created["manifest"]
+    assert [item["problem_id"] for item in manifest["items"]] == [1000, 1001]
+    assert client.post(f"/api/upload-manifests/{manifest['id']}/confirm", json={"problem_ids": [9999]}).status_code == 422
+    # 1001은 올리지 못했다.
+    confirmed = client.post(f"/api/upload-manifests/{manifest['id']}/confirm", json={"problem_ids": [1000]}).json()
+    assert confirmed["confirmed"] == [1000]
+    statuses = lambda: {key: item["upload"]["status"] for key, item in history.by_problem(tmp_path).items()}
+    assert statuses() == {"1000": "uploaded", "1001": "none"}
+    assert client.get("/api/upload-manifests").json()["manifests"][0]["id"] == manifest["id"]
+
+    # 업로드 완료 뒤 내용을 바꿔 zip을 다시 만들면 재업로드 필요가 된다.
+    first.save_problem(dataclasses.replace(first.load_problem(), title="바뀐 제목"))
+    successful_export(first)
+    history.snapshot(tmp_path, synchronize=True)
+    assert statuses() == {"1000": "stale", "1001": "none"}
+
+    undone = client.post(f"/api/upload-manifests/{manifest['id']}/undo").json()
+    assert undone["confirmed"] == [] and statuses() == {"1000": "none", "1001": "none"}
+    assert client.post("/api/upload-manifests/missing/undo").status_code == 404
+
+
+def test_undo_keeps_records_confirmed_by_a_later_download(client, tmp_path):
+    ws = ready_workspace(tmp_path, 1000)
+    successful_export(ws)
+    older = client.post("/api/upload-manifests", json={"slug": ws.slug}).json()["manifest"]
+    newer = client.post("/api/upload-manifests", json={"slug": ws.slug}).json()["manifest"]
+    client.post(f"/api/upload-manifests/{older['id']}/confirm", json={"problem_ids": [1000]})
+    client.post(f"/api/upload-manifests/{newer['id']}/confirm", json={"problem_ids": [1000]})
+    client.post(f"/api/upload-manifests/{older['id']}/undo")
+    assert history.by_problem(tmp_path)["1000"]["upload"]["manifest"] == newer["id"]
+
+
+def test_single_download_manifest_requires_one_target_and_skips_non_boj(client, tmp_path):
+    assert client.post("/api/upload-manifests", json={}).status_code == 422
+    assert client.post("/api/upload-manifests", json={"batch_id": "x", "slug": "y"}).status_code == 422
+    plain = create_workspace(make_problem(slug="custom", boj_id=None, solution_confirmed=True), base_dir=tmp_path)
+    plain.save_cases_index([exporter.write_case(plain.cases_dir, 1, b"1 2\n", b"3\n", label="example")])
+    problem_export.export_problem(plain, export_metadata(plain))
+    response = client.post("/api/upload-manifests", json={"slug": plain.slug}).json()
+    assert response["manifest"] is None and response["download_url"] == f"/api/problems/{plain.slug}/download"
 
 
 def test_batch_download_exports_attached_multi_problem_layout(client, tmp_path):
@@ -224,8 +285,9 @@ def test_metadata_preview_preserves_valid_zip_and_reuses_classification(tmp_path
     path = successful_export(ws)
     before = path.read_bytes()
     class Executor:
-        def run_on_bytes(self, *args, **kwargs):
-            return RunResult(verdict=Verdict.OK)
+        def run_on_bytes(self, path, data, *args, **kwargs):
+            return RunResult(verdict=Verdict.OK, stdout=b"" if path.name == "validator.py"
+                             else str(sum(map(int, data.split()))).encode())
         def run_script(self, path, stdin, *args, **kwargs):
             return RunResult(verdict=Verdict.OK, stdout=str(sum(map(int, stdin.read_bytes().split()))).encode())
     pipeline = Pipeline(ws, FakeCLI(default_responses()))
@@ -296,3 +358,28 @@ def test_problem_zip_rejects_noncanonical_difficulty_names(tmp_path, name):
     info = {**export_metadata(ws), "difficulty": name}
     with pytest.raises(exporter.ExportError, match="난이도"):
         problem_export.export_problem(ws, info)
+
+
+def test_catalog_filters_by_upload_status_with_counts(client, collection, tmp_path):
+    ready, uploaded, stale = (ready_workspace(tmp_path, number) for number in (1000, 1001, 1002))
+    for ws in (ready, uploaded, stale):
+        successful_export(ws)
+    history.set_uploaded(tmp_path, 1001, True)
+    history.set_uploaded(tmp_path, 1002, True)
+    stale.save_problem(dataclasses.replace(stale.load_problem(), title="바뀐 제목"))
+    successful_export(stale)
+    history.snapshot(tmp_path, synchronize=True)
+
+    def ids(status):
+        page = client.get(f"/api/boj?status={status}&limit=50").json()
+        return [item["problem_id"] for item in page["items"]], page["counts"]
+
+    total = client.get("/api/boj").json()["total"]
+    assert ids("uploaded")[0] == [1001]
+    # 업로드 대기: zip이 있고 업로드하지 않았거나 재업로드가 필요한 문제
+    assert ids("pending_upload")[0] == [1000, 1002]
+    not_uploaded, counts = ids("not_uploaded")
+    # 미업로드는 업로드 완료·업로드 대기와 겹치지 않는다.
+    assert not {1000, 1001, 1002} & set(not_uploaded)
+    assert counts == {"all": total, "uploaded": 1, "pending_upload": 2, "not_uploaded": total - 3}
+    assert client.get("/api/boj?status=bogus").status_code == 422

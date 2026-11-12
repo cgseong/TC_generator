@@ -1,8 +1,15 @@
-"""불러온 문제, 검증된 내보내기, 사용자가 조정한 완료 표시를 보관한다."""
+"""불러온 문제, 검증된 내보내기, 문제 사이트 업로드 기록을 보관한다.
+
+zip 준비(앱이 판정)와 업로드(사람이 확인)는 서로 다른 상태다. 업로드는 앱이
+내려준 zip 묶음(내려받기 기록) 단위로 확인받고, 그 zip의 해시를 남겨 올린 뒤
+zip을 다시 만들면 "재업로드 필요"로 알린다.
+"""
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,6 +18,8 @@ from tcgen.workspace import Workspace, WorkspaceError, ensure_safe_slug, list_wo
 
 _lock = threading.RLock()
 _FILENAME = ".tcgen-history.json"
+_MANIFEST_LIMIT = 100
+UPLOAD_NONE, UPLOAD_DONE, UPLOAD_STALE = "none", "uploaded", "stale"
 
 
 def now() -> str:
@@ -38,17 +47,44 @@ def _read(root: Path) -> dict:
     return {key: entry for key, entry in entries.items() if isinstance(entry, dict)} if isinstance(entries, dict) else {}
 
 
-def _overrides(root: Path) -> dict:
-    values = _document(root).get("completion_overrides", {})
-    return {key: entry for key, entry in values.items() if isinstance(entry, dict) and type(entry.get("completed")) is bool} if isinstance(values, dict) else {}
+def _sha256(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
 
 
-def _write(root: Path, entries: dict, overrides: dict | None = None) -> None:
+def _uploads(root: Path) -> dict:
+    document = _document(root)
+    values = document.get("uploads", {})
+    uploads = ({key: entry for key, entry in values.items() if isinstance(entry, dict) and entry.get("uploaded_at")}
+               if isinstance(values, dict) else {})
+    # 예전 버전의 수동 "완료" 표시는 업로드했다는 뜻으로 쓰였다. 업로드 기록으로 옮긴다.
+    legacy = document.get("completion_overrides", {})
+    if isinstance(legacy, dict):
+        for key, entry in legacy.items():
+            if isinstance(entry, dict) and entry.get("completed") is True and key not in uploads:
+                uploads[key] = {"uploaded_at": entry.get("updated_at") or now(), "sha256": None,
+                                "manifest": None, "source": "legacy", "title": entry.get("title", "")}
+    return uploads
+
+
+def _manifests(root: Path) -> dict:
+    values = _document(root).get("manifests", {})
+    return {key: entry for key, entry in values.items() if isinstance(entry, dict)} if isinstance(values, dict) else {}
+
+
+def _write(root: Path, entries: dict, uploads: dict | None = None, manifests: dict | None = None) -> None:
     root.mkdir(parents=True, exist_ok=True)
     path = root / _FILENAME
     staging = path.with_suffix(".part")
-    payload = {"version": 2, "entries": entries,
-               "completion_overrides": _overrides(root) if overrides is None else overrides}
+    payload = {"version": 3, "entries": entries,
+               "uploads": _uploads(root) if uploads is None else uploads,
+               "manifests": _manifests(root) if manifests is None else manifests}
     staging.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     staging.replace(path)
 
@@ -81,19 +117,32 @@ def _capture(workspace: Workspace, previous: dict) -> dict:
             entry["exported_at"] = previous.get("exported_at") or datetime.fromtimestamp(archive.stat().st_mtime, timezone.utc).isoformat()
             entry["case_count"] = export["case_count"]
             entry["status"] = "exported"
+            entry["_export_sha"] = _sha256(archive)
         else:
             entry["_export_stamp"] = None
+            entry["_export_sha"] = None
         entry["_scan"] = stamp
+    elif entry.get("_export_stamp") and not entry.get("_export_sha"):
+        # 해시를 남기기 전 버전에서 기록된 내보내기.
+        entry["_export_sha"] = _sha256(archive)
     return entry
 
 
-def _completion(root: Path, result: dict, overrides: dict | None = None) -> dict:
-    values = _overrides(root) if overrides is None else overrides
-    override = values.get(str(result.get("boj_id")))
-    result["auto_exported"] = result["exported"]
-    result["completed"] = override["completed"] if override else result["exported"]
-    result["completion_source"] = "manual" if override else "automatic"
-    result["completed_at"] = override.get("updated_at") if override else result.get("exported_at")
+def _status(root: Path, result: dict, uploads: dict | None = None, export_sha: str | None = None) -> dict:
+    values = _uploads(root) if uploads is None else uploads
+    upload = values.get(str(result.get("boj_id")))
+    if upload is None:
+        state = UPLOAD_NONE
+    elif result["exported"] and upload.get("sha256") and export_sha and upload["sha256"] != export_sha:
+        # 올린 뒤 zip을 다시 만들었다. 문제 사이트에는 예전 zip이 올라가 있다.
+        state = UPLOAD_STALE
+    else:
+        state = UPLOAD_DONE
+    result["upload"] = {"status": state, "uploaded_at": (upload or {}).get("uploaded_at"),
+                        "manifest": (upload or {}).get("manifest"), "source": (upload or {}).get("source")}
+    # 일괄 실행에서 건너뛸 문제: zip이 준비됐거나 이미 올렸다.
+    result["completed"] = result["exported"] or state != UPLOAD_NONE
+    result["completed_at"] = (upload or {}).get("uploaded_at") or result.get("exported_at")
     return result
 
 
@@ -110,7 +159,7 @@ def _public(root: Path, entry: dict) -> dict:
     result["exported"] = current
     if result.get("status") == "exported" and not current:
         result["status"] = "needs_review"
-    return _completion(root, result)
+    return _status(root, result, export_sha=entry.get("_export_sha") if current else None)
 
 
 def record(workspace: Workspace, *, stage: str | None = None, status: str | None = None,
@@ -125,22 +174,90 @@ def record(workspace: Workspace, *, stage: str | None = None, status: str | None
             entry["status"] = status
         entry["error"] = error
         entry["updated_at"] = now()
-        overrides = _overrides(root)
         if exported:
             entry["exported_at"] = now()
-            # 새 내보내기가 성공하면 자동으로 다시 완료 처리한다.
-            overrides.pop(str(entry.get("boj_id")), None)
         entries[workspace.slug] = entry
-        _write(root, entries, overrides)
+        _write(root, entries)
         return _public(root, entry)
 
 
-def set_completion(root: Path, problem_id: int, completed: bool, *, title: str = "") -> dict:
+def _current_export_sha(root: Path, problem_id: int) -> str | None:
+    for entry in _read(root).values():
+        if entry.get("boj_id") == problem_id and _public(root, entry)["exported"]:
+            return entry.get("_export_sha")
+    return None
+
+
+def set_uploaded(root: Path, problem_id: int, uploaded: bool, *, title: str = "") -> dict:
+    """한 문제의 업로드 기록을 직접 남기거나 지운다. 지금 zip을 올린 것으로 본다."""
     with _lock:
-        overrides = _overrides(root)
-        overrides[str(problem_id)] = {"completed": completed, "updated_at": now(), "title": title}
-        _write(root, _read(root), overrides)
-        return by_problem(root, problem_ids=[problem_id])[str(problem_id)]
+        uploads = _uploads(root)
+        if uploaded:
+            uploads[str(problem_id)] = {"uploaded_at": now(), "sha256": _current_export_sha(root, problem_id),
+                                        "manifest": None, "source": "manual", "title": title}
+        else:
+            uploads.pop(str(problem_id), None)
+        _write(root, _read(root), uploads)
+        current = by_problem(root, problem_ids=[problem_id]).get(str(problem_id))
+        # 작업 폴더 없이 기록만 있던 문제는 지우면 기록이 남지 않는다.
+        return current or _status(root, {"boj_id": problem_id, "slug": "", "title": title,
+                                         "exported": False, "updated_at": now()})
+
+
+def create_manifest(root: Path, items: list[dict], *, kind: str) -> dict:
+    """내려준 zip 묶음을 기록한다. items: problem_id, slug, title, path."""
+    with _lock:
+        manifests = _manifests(root)
+        manifest = {"id": uuid.uuid4().hex, "kind": kind, "created_at": now(), "confirmed": [], "confirmed_at": None,
+                    "items": [{"problem_id": item["problem_id"], "slug": item["slug"], "title": item.get("title", ""),
+                               "sha256": _sha256(item["path"])} for item in items]}
+        manifests[manifest["id"]] = manifest
+        for key in sorted(manifests, key=lambda key: manifests[key].get("created_at", ""))[:-_MANIFEST_LIMIT]:
+            manifests.pop(key)
+        _write(root, _read(root), manifests=manifests)
+        return manifest
+
+
+def confirm_manifest(root: Path, manifest_id: str, problem_ids: list[int]) -> dict:
+    """내려받은 묶음 중 실제로 올린 문제를 기록한다. 기록하는 해시는 내려받을 때의 zip이다."""
+    with _lock:
+        manifests, uploads = _manifests(root), _uploads(root)
+        manifest = manifests.get(manifest_id)
+        if manifest is None:
+            raise KeyError(manifest_id)
+        items = {item["problem_id"]: item for item in manifest["items"]}
+        unknown = set(problem_ids) - set(items)
+        if unknown:
+            raise ValueError(f"이 내려받기에 없는 문제입니다: {', '.join(map(str, sorted(unknown)))}")
+        stamp = now()
+        for number in problem_ids:
+            item = items[number]
+            uploads[str(number)] = {"uploaded_at": stamp, "sha256": item["sha256"], "manifest": manifest_id,
+                                    "source": "download", "title": item["title"]}
+        manifest["confirmed"] = sorted(set(manifest["confirmed"]) | set(problem_ids))
+        manifest["confirmed_at"] = stamp
+        _write(root, _read(root), uploads, manifests)
+        return manifest
+
+
+def undo_manifest(root: Path, manifest_id: str) -> dict:
+    """이 묶음으로 남긴 업로드 기록을 지운다. 그 뒤 다른 묶음으로 다시 기록한 문제는 건드리지 않는다."""
+    with _lock:
+        manifests, uploads = _manifests(root), _uploads(root)
+        manifest = manifests.get(manifest_id)
+        if manifest is None:
+            raise KeyError(manifest_id)
+        for key in [key for key, entry in uploads.items() if entry.get("manifest") == manifest_id]:
+            uploads.pop(key)
+        manifest["confirmed"], manifest["confirmed_at"] = [], None
+        _write(root, _read(root), uploads, manifests)
+        return manifest
+
+
+def recent_manifests(root: Path, *, limit: int = 10) -> list[dict]:
+    with _lock:
+        manifests = sorted(_manifests(root).values(), key=lambda entry: entry.get("created_at", ""), reverse=True)
+        return manifests[:limit]
 
 
 def snapshot(root: Path, *, synchronize: bool = False) -> list[dict]:
@@ -176,8 +293,8 @@ def by_problem(root: Path, *, problem_ids=None) -> dict:
             key = str(entry["boj_id"])
             if key not in result or (entry["exported"] and not result[key]["exported"]):
                 result[key] = entry
-        for key, override in _overrides(root).items():
+        for key, upload in _uploads(root).items():
             if key not in result and key.isdigit() and (wanted is None or int(key) in wanted):
-                result[key] = _completion(root, {"boj_id": int(key), "slug": "", "title": override.get("title", ""),
-                                                "exported": False, "updated_at": override["updated_at"]})
+                result[key] = _status(root, {"boj_id": int(key), "slug": "", "title": upload.get("title", ""),
+                                             "exported": False, "updated_at": upload["uploaded_at"]})
         return result

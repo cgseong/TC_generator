@@ -21,9 +21,11 @@ from __future__ import annotations
 import itertools
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,27 +101,73 @@ class LLMResponse:
 CommandRunner = Callable[[Sequence[str], str, float], subprocess.CompletedProcess]
 
 
+class TokenUsage:
+    """한 클라이언트가 쓴 토큰과 API 환산 비용을 누적한다. 실패한 호출도 센다."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._totals = {"input": 0, "cached": 0, "output": 0, "calls": 0}
+        self._cost = 0.0
+        self._unpriced_calls = 0
+        self._models: list[str] = []
+
+    def add(
+        self, *, input: int = 0, cached: int = 0, output: int = 0,
+        cost_usd: float | None = None, models: Sequence[str] = (),
+    ) -> None:
+        with self._lock:
+            self._totals["input"] += input
+            self._totals["cached"] += cached
+            self._totals["output"] += output
+            self._totals["calls"] += 1
+            if cost_usd is None:
+                self._unpriced_calls += 1
+            else:
+                self._cost += cost_usd
+            self._models.extend(model for model in models if model and model not in self._models)
+
+    def snapshot(self) -> dict[str, Any]:
+        """``input``은 캐시 적중분(``cached``)을 포함한 전체 입력 토큰이다.
+
+        ``cost_usd``는 단가를 아는 호출만 더한 값이고, 모르는 호출 수는
+        ``unpriced_calls``로 따로 알린다.
+        """
+        with self._lock:
+            totals = dict(self._totals)
+            cost, unpriced, models = self._cost, self._unpriced_calls, list(self._models)
+        return {**totals, "total": totals["input"] + totals["output"], "cost_usd": round(cost, 6),
+                "unpriced_calls": unpriced, "models": models}
+
+
+def _token_count(value: Any) -> int:
+    return value if isinstance(value, int) and value > 0 else 0
+
+
 class LLMClient(Protocol):
     def ask_code(self, prompt: str, *, tag: str = "code") -> str: ...
     def ask_json(self, prompt: str, *, tag: str = "json") -> dict[str, Any]: ...
     def ask_json_about_files(self, prompt: str, paths: Sequence[Path], *, tag: str = "file") -> dict[str, Any]: ...
 
 
-def make_cli(provider: str = "claude", *, model: str | None = None, log_dir: Path | None = None) -> LLMClient:
+def make_cli(
+    provider: str = "claude", *, model: str | None = None, effort: str | None = None,
+    log_dir: Path | None = None,
+) -> LLMClient:
     if provider == "claude":
-        return ClaudeCLI(model=model, log_dir=log_dir)
-    if provider == "anthropic":
-        from tcgen.anthropic_client import AnthropicSDKClient
-        return AnthropicSDKClient(model=model or "claude-opus-5-5", log_dir=log_dir)
+        return ClaudeCLI(model=model, effort=effort, log_dir=log_dir)
     if provider == "codex":
         from tcgen.codex import CodexCLI
-        return CodexCLI(model=model, log_dir=log_dir)
+        return CodexCLI(model=model, effort=effort, log_dir=log_dir)
     raise ValueError(f"지원하지 않는 AI 제공자입니다: {provider}")
 
 
 def _run_subprocess(
     argv: Sequence[str], prompt: str, timeout_s: float
 ) -> subprocess.CompletedProcess:
+    # API 키가 있으면 CLI가 구독 로그인 대신 API 크레딧으로 과금하므로 제거한다.
+    env = dict(os.environ)
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+        env.pop(key, None)
     return subprocess.run(  # noqa: S603 - 실행 파일은 claude CLI로 고정된다
         list(argv),
         input=prompt,
@@ -129,6 +177,7 @@ def _run_subprocess(
         errors="replace",
         timeout=timeout_s,
         check=False,
+        env=env,
     )
 
 
@@ -144,6 +193,8 @@ class ClaudeCLI:
     log_dir: Path | None = None
     max_retries: int = LLM_MAX_RETRIES
     runner: CommandRunner = field(default=_run_subprocess, repr=False)
+    effort: str | None = None
+    usage: TokenUsage = field(default_factory=TokenUsage, repr=False, compare=False)
 
     def ask(
         self, prompt: str, *, tag: str = "ask", readable_dirs: Sequence[Path] = ()
@@ -165,6 +216,7 @@ class ClaudeCLI:
         duration_ms = int((time.perf_counter() - started) * 1000)
         # 실패 응답도 기록한 뒤 해석한다. 해석에서 먼저 예외가 나면 원인이 사라진다.
         self._write_log(tag, prompt, completed, duration_ms)
+        _record_claude_usage(self.usage, completed.stdout)
         text = _extract_result_text(completed)
         return LLMResponse(text=text, duration_ms=duration_ms, tag=tag)
 
@@ -239,6 +291,8 @@ class ClaudeCLI:
         ]
         if self.model:
             argv.extend(["--model", self.model])
+        if self.effort:
+            argv.extend(["--effort", self.effort])
         if readable_dirs:
             # --add-dir은 가변 인자라 뒤따르는 값을 모두 삼킨다. 맨 끝에 둔다.
             argv.extend(["--allowed-tools", READ_TOOL, "--add-dir"])
@@ -286,6 +340,25 @@ def _read_result_payload(stdout: str | None) -> Mapping[str, Any] | None:
     except (ValueError, TypeError):
         return None
     return payload if isinstance(payload, Mapping) else None
+
+
+def _record_claude_usage(usage: TokenUsage, stdout: str | None) -> None:
+    payload = _read_result_payload(stdout)
+    if payload is None:
+        return
+    stats = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
+    cached = _token_count(stats.get("cache_read_input_tokens"))
+    # 보조 작업에 작은 모델을 함께 쓰기도 하므로 보고된 모델을 모두 남긴다.
+    model_usage = payload.get("modelUsage")
+    models = list(model_usage) if isinstance(model_usage, Mapping) else []
+    # CLI가 알려 주는 total_cost_usd는 구독으로 실행해도 API 정가 기준이다.
+    cost = payload.get("total_cost_usd")
+    usage.add(
+        input=_token_count(stats.get("input_tokens")) + cached
+        + _token_count(stats.get("cache_creation_input_tokens")),
+        cached=cached, output=_token_count(stats.get("output_tokens")),
+        cost_usd=float(cost) if isinstance(cost, (int, float)) else None, models=models,
+    )
 
 
 def _failure_detail(

@@ -742,3 +742,24 @@ class TestRealCollection:
         assert problem.title == "A+B"
         assert problem.limits.to_dict() == {"time_ms": 2000, "memory_mb": 128, "assumed": False}
         assert problem.examples[0].input == "1 2\n"
+
+
+def test_catalog_marks_special_judge_problems_from_page_label(tmp_path, monkeypatch):
+    monkeypatch.setattr(boj, "CATALOG_CACHE_DIR", tmp_path / "cache")
+    path = tmp_path / "spj.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("CREATE TABLE problems (problem_id INTEGER PRIMARY KEY, title TEXT, "
+                           "time_limit TEXT, memory_limit TEXT, raw_html TEXT)")
+        connection.executemany("INSERT INTO problems VALUES (?, ?, '1 초', '128 MB', ?)", [
+            (1000, "A+B", '<span class="problem-label problem-label-multilang">다국어</span>'),
+            (1001, "정답 여러 개", '<span class="problem-label problem-label-spj">스페셜 저지</span>'),
+            (1002, "원문 없음", None),
+        ])
+        connection.commit()
+    flags = {item["problem_id"]: item["special_judge"] for item in boj.list_problems(db_path=path, limit=10)["items"]}
+    assert flags == {1000: False, 1001: True, 1002: False}
+    # 디스크 캐시에서 다시 읽어도 같다.
+    boj._catalogs.clear()
+    assert boj.list_problems(db_path=path, limit=10)["items"][1]["special_judge"] is True
+    first = boj.initial_catalog_page(db_path=path)["items"]
+    assert [item["special_judge"] for item in first] == [False, True, False]

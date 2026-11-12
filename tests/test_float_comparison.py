@@ -6,7 +6,7 @@ from tcgen import compare, exporter
 from tcgen.engine.finalize import verify_cases
 from tcgen.engine.solution import check_examples, run_stress
 from tcgen.engine.strength import MutantSpec, evaluate_mutant
-from tcgen.engine.metadata import select_samples
+from tcgen.engine.metadata import original_samples
 from tcgen.models import Example
 from tcgen.runner.base import RunResult, Verdict
 from tcgen.workspace import create_workspace
@@ -66,9 +66,7 @@ def test_final_brute_comparison_allows_precision_but_saved_output_remains_exact(
     assert not result["passed"] and "재실행 출력 불일치" in result["results"][0]["note"]
 
 
-def test_extra_small_samples_use_the_same_numeric_comparison(tmp_path):
+def test_public_samples_preserve_original_float_output_without_reformatting(tmp_path):
     ws = create_workspace(float_problem(), base_dir=tmp_path)
-    (ws.gens_dir / "stress_gen.py").write_text("# simulated")
-    result = select_samples(ws, FloatExecutor())
-    assert len(result["samples"]) == 2
-    assert all(item["brute_matched"] for item in result["sample_sources"])
+    result = original_samples(ws.load_problem())
+    assert result["samples"] == [{"input": "1\n", "output": LONG.decode()}]
